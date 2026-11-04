@@ -104,19 +104,30 @@ void LongShotBar::tick() {
             }
             if (diff < 2000) return;   // 没变化
         }
-        bool matched = false;
-        int dir = 0;
-        QImage next = longshot::appendAuto(m_canvas, frame, &dir, &matched);
-        if (matched) {
-            m_canvas = next;
-            m_dir = dir;
-            m_frames++;
+        // 长截图固定竖向拼接；先判断滚动方向，回滚（向上滚）的帧直接丢弃，
+        // 否则会把已经拍过的内容再拼一遍。
+        const int dy = longshot::verticalShift(m_prev, frame);
+        bool skip = false;
+        if (dy != INT_MIN && dy <= 1) {
+            skip = true;                      // 回滚或没滚动
+            m_rolledBack += (dy != INT_MIN && dy < -1) ? 1 : 0;
+        }
+        if (!skip) {
+            bool matched = false;
+            QImage next = longshot::appendFrame(m_canvas, frame, &matched);
+            if (matched) {
+                m_canvas = next;
+                m_dir = 0;                    // 竖向
+                m_frames++;
+            }
         }
         m_prev = frame;
     }
-    m_info->setText(QStringLiteral("长截图：已拼接 %1 段（%2） %3 x %4 px")
-                        .arg(m_frames + 1).arg(m_dir ? QStringLiteral("横向") : QStringLiteral("竖向"))
-                        .arg(m_canvas.width()).arg(m_canvas.height()));
+    QString info = QStringLiteral("长截图：已拼接 %1 段（竖向） %2 x %3 px")
+                       .arg(m_frames + 1).arg(m_canvas.width()).arg(m_canvas.height());
+    if (m_rolledBack > 0)
+        info += QStringLiteral(" · 已忽略 %1 次回滚").arg(m_rolledBack);
+    m_info->setText(info);
     QImage thumb = m_canvas.scaledToHeight(28, Qt::SmoothTransformation);
     if (thumb.width() > 296) thumb = thumb.copy(thumb.width() - 296, 0, 296, thumb.height());
     m_preview->setPixmap(QPixmap::fromImage(thumb));

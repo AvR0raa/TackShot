@@ -34,6 +34,7 @@ private:
     QLabel* m_info = nullptr;
     QLabel* m_preview = nullptr;
     int m_frames = 0;
+    int m_rolledBack = 0;
     int m_dir = 0;
 };
 
@@ -62,6 +63,7 @@ private:
     bool m_useMp4 = false;
     qint64 m_startMs = 0;
     int m_frames = 0;
+    int m_rolledBack = 0;
     QString m_path;
     QPoint m_dragOffset;
     bool m_dragging = false;
