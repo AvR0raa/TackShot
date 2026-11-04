@@ -38,6 +38,10 @@ public:
     QString ocrBackend = "local";               // local / online / auto
     bool    ocrFormula = true;                  // 是否启用公式识别
     bool    ocrPrivacyAccepted = false;         // 在线识别隐私确认
+    QString baiduAppId;                         // 百度翻译开放平台 APPID
+    QString baiduSecret;                        // 百度翻译密钥（DPAPI 存密钥）
+    int     baiduPaste = 1;                     // 0 关闭贴合 / 1 整图 / 2 分块
+    QString simpleTexToken;                     // SimpleTex UAT（DPAPI 存）
     QString visionProvider = "gemini";          // 视觉模型 engine（复用 translate 预设体系）
     QString visionBaseUrl;                      // 空 = 用预设
     QString visionModel;                        // 空 = 用预设

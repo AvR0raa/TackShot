@@ -6,7 +6,7 @@
 #include <QStringList>
 #include <QVector>
 
-#include "ocr.h"
+#include "ocrline.h"
 
 class QComboBox;
 class QLabel;

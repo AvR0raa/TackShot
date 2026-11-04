@@ -10,10 +10,11 @@
 #include "overlay.h"
 #include "pinwindow.h"
 #include "settingsdialog.h"
-#include "ocr.h"
+#include "ocrline.h"
 #include "ocrdialog.h"
 #include "vision.h"
-#include "formula.h"
+#include "baidu.h"
+#include "simpletex.h"
 #include "longshot.h"
 #include "gifenc.h"
 #include "mfrec.h"
@@ -455,29 +456,60 @@ int main(int argc, char** argv) {
     }
 
     // 本地公式模型自检：给一张公式图，输出 LaTeX
-    int fmIdx = args.indexOf("--formula-selftest");
-    if (fmIdx >= 0) {
-        QString imgPath = (fmIdx + 1 < args.size()) ? args[fmIdx + 1] : "formula.png";
-        QString outTxt = (fmIdx + 2 < args.size()) ? args[fmIdx + 2] : (imgPath + ".txt");
-        QImage img(imgPath);
-        QString err;
-        FormulaRecognizer& fr = FormulaRecognizer::get();
-        QString latex;
-        QElapsedTimer t; t.start();
-        if (fr.init(QString(), &err)) latex = fr.recognize(img);
-        const qint64 ms = t.elapsed();
 
-        QFile f(outTxt);
+    // 云端识别自检：百度图片翻译 + SimpleTex 公式（对着 mock 跑）
+    int csIdx = args.indexOf("--cloud-selftest");
+    if (csIdx >= 0) {
+        QString out = (csIdx + 1 < args.size()) ? args[csIdx + 1] : "cloud.txt";
+        QImage img(320, 160, QImage::Format_RGB32);
+        img.fill(Qt::white);
+        {
+            QPainter p(&img);
+            p.setPen(Qt::black);
+            QFont f; f.setPixelSize(18); p.setFont(f);
+            p.drawText(QRect(10, 20, 300, 30), Qt::AlignLeft, QStringLiteral("这是第一段"));
+            p.drawText(QRect(10, 70, 300, 30), Qt::AlignLeft, QStringLiteral("第二段文字"));
+        }
+        QStringList log;
+        bool pass = true;
+
+        BaiduPictureTranslate bd;
+        auto br = bd.translate(img, QStringLiteral("auto"), QStringLiteral("en"),
+                               QStringLiteral("appid-test"), QStringLiteral("secret-test"), 1);
+        bool p1 = br.ok && br.lines.size() == 2 &&
+                  br.lines[0].dst.contains("first") && br.lines[0].rect.width() == 200 &&
+                  !br.pasteImage.isNull();
+        log << QString("baidu: ok=%1 lines=%2 rect0=%3,%4 %5x%6 paste=%7x%8 pass=%9")
+                   .arg(br.ok).arg(br.lines.size())
+                   .arg(br.lines.isEmpty() ? -1 : br.lines[0].rect.x())
+                   .arg(br.lines.isEmpty() ? -1 : br.lines[0].rect.y())
+                   .arg(br.lines.isEmpty() ? -1 : br.lines[0].rect.width())
+                   .arg(br.lines.isEmpty() ? -1 : br.lines[0].rect.height())
+                   .arg(br.pasteImage.width()).arg(br.pasteImage.height()).arg(p1);
+        pass &= p1;
+
+        SimpleTexClient st;
+        auto sr = st.recognize(img, QStringLiteral("uat-test"), true);
+        bool p2 = sr.ok && sr.latex.contains("a^{2}");
+        log << QString("simpletex: ok=%1 latex=%2 conf=%3 pass=%4")
+                   .arg(sr.ok).arg(sr.latex).arg(sr.confidence).arg(p2);
+        pass &= p2;
+
+        auto bad = st.recognize(img, QString(), true);
+        bool p3 = !bad.ok && !bad.error.isEmpty();
+        log << QString("simpletex-no-token: ok=%1 err=%2 pass=%3")
+                   .arg(bad.ok).arg(bad.error.left(20)).arg(p3);
+        pass &= p3;
+
+        log << QString("ALL_PASS=%1").arg(pass ? "true" : "false");
+        QFile f(out);
         if (f.open(QIODevice::WriteOnly)) {
             QTextStream ts(&f);
             ts.setEncoding(QStringConverter::Utf8);
-            ts << "image=" << imgPath << " " << img.width() << "x" << img.height() << "\n";
-            ts << "ready=" << (fr.ready() ? "true" : "false") << " err=" << err << "\n";
-            ts << "ms=" << ms << "\n";
-            ts << "latex=" << latex << "\n";
+            for (const QString &l : log) ts << l << "\n";
             f.close();
         }
-        return latex.isEmpty() ? 22 : 0;
+        return pass ? 0 : 24;
     }
 
     // 在线视觉识别自检：跑 mock 服务器的三个端点
@@ -1087,10 +1119,18 @@ int main(int argc, char** argv) {
         }
         img.save(outdir + "/tr_input.png");
 
-        Ocr& ocr = Ocr::get();
         QString err;
-        bool ocrOk = ocr.init(&err);
-        QVector<OcrLine> lines = ocrOk ? ocr.recognize(img, &err) : QVector<OcrLine>();
+        // 本地模型已移除：这里用合成行验证“译文回填”渲染链路
+        QVector<OcrLine> lines;
+        {
+            OcrLine a; a.text = QStringLiteral("Open file and save as"); a.score = 0.99f;
+            a.box = QRect(47, 44, 420, 36); lines.append(a);
+            OcrLine b; b.text = QStringLiteral("Settings panel"); b.score = 0.98f;
+            b.box = QRect(46, 112, 300, 36); lines.append(b);
+            OcrLine c; c.text = QStringLiteral("Exit application"); c.score = 0.97f;
+            c.box = QRect(46, 183, 300, 36); lines.append(c);
+        }
+        bool ocrOk = !lines.isEmpty();
 
         ProviderPreset p;
         p.id = "mock";
@@ -1573,54 +1613,6 @@ int main(int argc, char** argv) {
     }
 
     // OCR 自检：合成一张带文字的图，跑本地识别并落盘结果
-    int ocrIdx = args.indexOf("--ocr-selftest");
-    if (ocrIdx >= 0) {
-        QString outdir = (ocrIdx + 1 < args.size()) ? args[ocrIdx + 1] : ".";
-        QDir().mkpath(outdir);
-        QImage img(1000, 360, QImage::Format_RGB32);
-        img.fill(Qt::white);
-        {
-            QPainter p(&img);
-            p.setRenderHint(QPainter::TextAntialiasing, true);
-            p.setPen(Qt::black);
-            QFont f(QStringLiteral("Microsoft YaHei"));
-            f.setPixelSize(40);
-            p.setFont(f);
-            p.drawText(40, 80, QStringLiteral("TackShot 本地文字识别"));
-            f.setPixelSize(32);
-            p.setFont(f);
-            p.drawText(40, 160, QStringLiteral("Hello OCR 12345 ABCDEFG"));
-            f.setPixelSize(30);
-            p.setFont(f);
-            p.drawText(40, 240, QStringLiteral("中文与 English 混排，标点：。，！？"));
-            p.drawText(40, 310, QStringLiteral("订单号 SN-2026-0042 金额 128.50"));
-        }
-        img.save(outdir + "/ocr_input.png");
-
-        Ocr& ocr = Ocr::get();
-        QString err;
-        QElapsedTimer timer; timer.start();
-        bool ok = ocr.init(&err);
-        QVector<OcrLine> lines;
-        if (ok) lines = ocr.recognize(img, &err);
-        qint64 ms = timer.elapsed();
-
-        QFile rf(outdir + "/ocr_result.txt");
-        if (rf.open(QIODevice::WriteOnly)) {
-            QTextStream ts(&rf);
-            ts.setEncoding(QStringConverter::Utf8);
-            ts << "init=" << (ok ? "ok" : "fail") << "\n";
-            if (!ok) ts << "error=" << err << "\n";
-            ts << "elapsedMs=" << ms << "\n";
-            ts << "lines=" << lines.size() << "\n";
-            for (const auto& l : lines)
-                ts << QString("[%1,%2 %3x%4] score=%5  %6\n")
-                        .arg(l.box.x()).arg(l.box.y()).arg(l.box.width()).arg(l.box.height())
-                        .arg(double(l.score), 0, 'f', 3).arg(l.text);
-            rf.close();
-        }
-        return ok ? 0 : 6;
-    }
 
     // 自检模式：抓屏并落盘，用于自动化验证
     int stIdx = args.indexOf("--selftest");

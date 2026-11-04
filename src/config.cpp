@@ -90,6 +90,8 @@ QJsonObject Config::toJson() const {
     o["ocrBackend"] = ocrBackend;
     o["ocrFormula"] = ocrFormula;
     o["ocrPrivacyAccepted"] = ocrPrivacyAccepted;
+    o["baiduAppId"] = baiduAppId;
+    o["baiduPaste"] = baiduPaste;
     o["visionProvider"] = visionProvider;
     o["visionBaseUrl"] = visionBaseUrl;
     o["visionModel"] = visionModel;
@@ -125,6 +127,8 @@ void Config::fromJson(const QJsonObject& o) {
     if (o.contains("ocrBackend")) ocrBackend = o["ocrBackend"].toString();
     if (o.contains("ocrFormula")) ocrFormula = o["ocrFormula"].toBool();
     if (o.contains("ocrPrivacyAccepted")) ocrPrivacyAccepted = o["ocrPrivacyAccepted"].toBool();
+    if (o.contains("baiduAppId")) baiduAppId = o["baiduAppId"].toString();
+    if (o.contains("baiduPaste")) baiduPaste = o["baiduPaste"].toInt();
     if (o.contains("visionProvider")) visionProvider = o["visionProvider"].toString();
     if (o.contains("visionBaseUrl")) visionBaseUrl = o["visionBaseUrl"].toString();
     if (o.contains("visionModel")) visionModel = o["visionModel"].toString();

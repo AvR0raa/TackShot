@@ -57,8 +57,11 @@ private:
     QPlainTextEdit*   m_trGlossary = nullptr;
     QSpinBox*         m_trChunk = nullptr;
 
-    QComboBox*        m_ocrBackend = nullptr;
     QCheckBox*        m_ocrFormula = nullptr;
+    QLineEdit*        m_baiduAppId = nullptr;
+    QLineEdit*        m_baiduSecret = nullptr;
+    QComboBox*        m_baiduPaste = nullptr;
+    QLineEdit*        m_simpleTexToken = nullptr;
     QComboBox*        m_visionProvider = nullptr;
     QLineEdit*        m_visionBase = nullptr;
     QLineEdit*        m_visionModel = nullptr;

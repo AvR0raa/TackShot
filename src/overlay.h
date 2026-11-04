@@ -5,7 +5,7 @@
 #include <QVector>
 #include <QPoint>
 #include "annotate.h"
-#include "ocr.h"
+#include "ocrline.h"
 
 class QToolButton;
 class QSpinBox;
