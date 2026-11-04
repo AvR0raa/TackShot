@@ -1,0 +1,29 @@
+
+## 24. 识别 / 翻译能力升级（本地公式模型 + 在线视觉 + 新弹窗）
+
+### 本地公式模型（pix2text-mfr-1.5，TrOCR 编码器-解码器）
+- 模型：encoder 83.46MB + decoder 30.54MB + BPE tokenizer（1868 词表），MIT
+- 预处理：缩放到 384x384，(x/255-0.5)/0.5
+- 解码：贪心，<s>=1 起始、</s>=2 结束，上限 200 token
+- 实测（C++ 实现 vs Python 参考，同一张图）：
+    Python: \mathrm { x 2 + y 2 = r 2 }
+    C++:    \mathrm{ x 2 + y 2 = r 2}    （仅空白规整差异）
+    耗时：1039 ms（首次加载含初始化）/ 1068 ms（安装目录内）
+
+### 在线视觉识别（VisionClient，OpenAI 兼容）
+- mock 自检：normal / 401 不重试 / 403 不重试，ALL_PASS=true
+- stats 返回 requests=3、lastHasImage=true，证明图片以 data URL 发出
+- 错误分类：401/403 Key 无效、402 余额、429 重试、5xx 重试、超时、404 地址错
+
+### 识别结果弹窗（OcrDialog）
+- 左原图（识别框高亮、选中行橙色）+ 右「文字 / 译文 / LaTeX」三页
+- 底部：源语言 -> 目标语言、模型下拉、翻译 / 译图 / 复制
+- 顶栏徽标：后端、行数、耗时；离屏渲染截图 build/ocrdlg.png
+
+### 翻译源语言
+- 新增 translateSource（默认 English），prompt 改为把英文翻译成中文
+- 缓存键加入源语言，改源语言不会命中旧缓存
+
+### 安装包
+- 183.08 MB（新增 114MB 公式模型），安装后 38 个文件、models 9 个
+- 安装目录内跑 --formula-selftest：ready=true，latex 正确

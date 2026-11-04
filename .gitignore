@@ -1,0 +1,27 @@
+# 构建产物
+build/
+build2/
+dist/
+
+# 第三方工具链与模型（体积大，不入库；见 README「从源码构建」）
+toolchain/
+dl/
+models/
+pylibs/
+
+# 杂项
+*.o
+*.exe
+*.log
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# 本地配置 / 密钥（绝不入库）
+*.dat
+config.json
+secrets.dat
+translate_cache.jsonl
+capture.log

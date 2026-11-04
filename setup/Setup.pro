@@ -1,0 +1,9 @@
+QT += core gui widgets
+CONFIG += c++17 windows
+CONFIG -= console
+TEMPLATE = app
+TARGET = TackShotSetup
+INCLUDEPATH += ../src
+SOURCES += Setup.cpp
+LIBS += -lole32 -luuid -lshell32 -luser32 -ladvapi32
+RC_ICONS = ../res/tackshot.ico
