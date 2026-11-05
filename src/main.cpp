@@ -14,6 +14,7 @@
 #include "ocrdialog.h"
 #include "vision.h"
 #include "baidu.h"
+#include "managed.h"
 #include "simpletex.h"
 #include "longshot.h"
 #include "gifenc.h"
@@ -293,6 +294,14 @@ int main(int argc, char** argv) {
             QThread::msleep(200);
             QCoreApplication::processEvents();
             dlg.grab().toImage().save(outdir + "/settings.png");
+            // 翻译页（引擎选百度时的表单状态）
+            if (auto* nav = dlg.findChild<QListWidget*>(); nav && nav->count() > 3) {
+                nav->setCurrentRow(3);
+                QCoreApplication::processEvents();
+                QThread::msleep(150);
+                QCoreApplication::processEvents();
+                dlg.grab().toImage().save(outdir + "/settings_translate.png");
+            }
         }
 
         {
@@ -461,6 +470,7 @@ int main(int argc, char** argv) {
     int csIdx = args.indexOf("--cloud-selftest");
     if (csIdx >= 0) {
         QString out = (csIdx + 1 < args.size()) ? args[csIdx + 1] : "cloud.txt";
+        qputenv("TACKSHOT_MANAGED_PROXY", "off");   // 本自检验证直连语义：禁用内置托管
         QImage img(320, 160, QImage::Format_RGB32);
         img.fill(Qt::white);
         {
@@ -591,7 +601,7 @@ int main(int argc, char** argv) {
         dlg.setTargetLang(QStringLiteral("简体中文"));
         QStringList ids;
         for (const auto& p : TranslateClient::presets()) ids << p.id;
-        dlg.setModels(ids, QStringLiteral("deepseek"));
+        dlg.setModels(ids, QStringLiteral("baidu"));
         dlg.show();
         QCoreApplication::processEvents();
         QThread::msleep(200);
@@ -1272,6 +1282,286 @@ int main(int argc, char** argv) {
             rf.close();
         }
         return allPass ? 0 : 13;
+    }
+
+    // 百度文本翻译自检：签名校验 / 多行 / 54003 限流重试 / 54001 签名错误 / TranslateClient 分发
+    int bdIdx = args.indexOf("--baidu-text-selftest");
+    if (bdIdx >= 0) {
+        QString base = (bdIdx + 1 < args.size()) ? args[bdIdx + 1] : "http://127.0.0.1:8899/baidu";
+        qputenv("TACKSHOT_MANAGED_PROXY", "off");   // 本自检验证直连语义：禁用内置托管
+        QString out = (bdIdx + 2 < args.size()) ? args[bdIdx + 2] : "baidu_text_report.txt";
+        const QString appId = QStringLiteral("20251105");
+        const QString secret = QStringLiteral("test-secret");   // 与 mock_translate_server.py 一致
+
+        QStringList log;
+        bool allPass = true;
+
+        // 1) 正常 + 多行
+        qputenv("TACKSHOT_BAIDU_TEXT_ENDPOINT", base.toUtf8());
+        BaiduTextResult r1 = BaiduTextTranslate::translate(
+            QStringLiteral("Hello, world\nSecond line"), QStringLiteral("auto"),
+            QStringLiteral("zh"), appId, secret);
+        bool p1 = r1.ok && r1.text.split(QLatin1Char('\n')).size() == 2
+                  && r1.text.startsWith(QStringLiteral("【中】"));
+        log << QString("normal: ok=%1 lines=%2 text=%3 pass=%4")
+                   .arg(r1.ok).arg(r1.text.split(QLatin1Char('\n')).size())
+                   .arg(r1.text.left(20)).arg(p1);
+        allPass &= p1;
+
+        // 2) 签名错误（密钥不对 -> 54001）
+        BaiduTextResult r2 = BaiduTextTranslate::translate(
+            QStringLiteral("hello"), QStringLiteral("auto"), QStringLiteral("zh"),
+            appId, QStringLiteral("wrong-secret"));
+        bool p2 = !r2.ok && r2.errorCode == 54001 && r2.error.contains(QStringLiteral("签名"));
+        log << QString("badSign: ok=%1 code=%2 err=%3 pass=%4")
+                   .arg(r2.ok).arg(r2.errorCode).arg(r2.error.left(24)).arg(p2);
+        allPass &= p2;
+
+        // 3) 54003 限流 -> 自动等待重试成功
+        qputenv("TACKSHOT_BAIDU_TEXT_ENDPOINT", (base + "/limit").toUtf8());
+        BaiduTextResult r3 = BaiduTextTranslate::translate(
+            QStringLiteral("retry me"), QStringLiteral("auto"), QStringLiteral("zh"),
+            appId, secret);
+        bool p3 = r3.ok && r3.text.contains(QStringLiteral("【中】"));
+        log << QString("limit54003: ok=%1 text=%2 pass=%3")
+                   .arg(r3.ok).arg(r3.text.left(16)).arg(p3);
+        allPass &= p3;
+
+        // 4) TranslateClient 按 baidu 预设分发（含语言名->语言码映射）
+        qputenv("TACKSHOT_BAIDU_TEXT_ENDPOINT", base.toUtf8());
+        Config::get().baiduAppId = appId;
+        ProviderPreset bp;
+        bp.id = QStringLiteral("baidu");
+        bp.model = QStringLiteral("baidu-text");
+        auto r4 = TranslateClient().translateLine(QStringLiteral("Hello"),
+                                                  QStringLiteral("简体中文"), bp, secret,
+                                                  QString(), QStringLiteral("English"));
+        bool p4 = r4.ok && r4.text.contains(QStringLiteral("【中】"))
+                  && r4.providerId == QStringLiteral("baidu");
+        log << QString("dispatch: ok=%1 provider=%2 text=%3 pass=%4")
+                   .arg(r4.ok).arg(r4.providerId).arg(r4.text.left(16)).arg(p4);
+        allPass &= p4;
+
+        // 5) 未配置凭据 -> 明确错误
+        Config::get().baiduAppId = QString();
+        auto r5 = TranslateClient().translateLine(QStringLiteral("Hello"),
+                                                  QStringLiteral("简体中文"), bp, secret);
+        bool p5 = !r5.ok && r5.error.contains(QStringLiteral("未配置"));
+        log << QString("unconfigured: ok=%1 err=%2 pass=%3")
+                   .arg(r5.ok).arg(r5.error.left(24)).arg(p5);
+        allPass &= p5;
+        Config::get().baiduAppId = appId;  // 还原，避免影响同进程后续自检
+
+        // 6) 批量：3 行一次请求完成（比逐行快一个数量级）
+        auto mockReqs = []() -> int {
+            QNetworkAccessManager mgr;
+            QNetworkRequest req{QUrl("http://127.0.0.1:8899/stats")};
+            req.setTransferTimeout(5000);
+            QNetworkReply* rp = mgr.get(req);
+            QEventLoop loop;
+            QObject::connect(rp, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+            loop.exec();
+            const QByteArray body = rp->readAll();
+            rp->deleteLater();
+            return QJsonDocument::fromJson(body).object()["requests"].toInt();
+        };
+        const int before = mockReqs();
+        auto r6 = TranslateClient().translateBatch(
+            {QStringLiteral("first line"), QStringLiteral("second line"),
+             QStringLiteral("third line")},
+            QStringLiteral("简体中文"), bp, secret);
+        const int newReqs = mockReqs() - before;
+        bool p6 = r6.failed == 0 && r6.lines.size() == 3
+                  && !r6.lines[0].isEmpty() && r6.lines[2].contains(QStringLiteral("【中】"))
+                  && newReqs == 1;
+        log << QString("batch: failed=%1 lines=%2 requests=%3 pass=%4")
+                   .arg(r6.failed).arg(r6.lines.size()).arg(newReqs).arg(p6);
+        allPass &= p6;
+
+        log << QString("ALL_PASS=%1").arg(allPass ? "true" : "false");
+        QFile bf(out);
+        if (bf.open(QIODevice::WriteOnly)) {
+            QTextStream ts(&bf);
+            ts.setEncoding(QStringConverter::Utf8);
+            for (const QString& l : log) ts << l << "\n";
+            bf.close();
+        }
+        return allPass ? 0 : 23;
+    }
+
+    // 真实百度接口诊断：用已存凭据各调一次文本/图片翻译，输出原始错误（排查开通/额度/签名）
+    int liveIdx = args.indexOf("--baidu-live-check");
+    if (liveIdx >= 0) {
+        QString out = (liveIdx + 1 < args.size()) ? args[liveIdx + 1] : "baidu_live_report.txt";
+        Config::get().load();   // 自检入口在主流程 load 之前，这里自己加载
+        const QString appId = Config::get().baiduAppId.trimmed();
+        const QString secret = secrets::load("baidu_secret");
+        QStringList log;
+        log << QString("config=%1 exists=%2")
+                   .arg(Config::get().configPath())
+                   .arg(QFile::exists(Config::get().configPath()));
+        log << QString("appId=%1 secret=%2 paste=%3")
+                   .arg(appId.isEmpty() ? "(missing)" : appId,
+                        secret.isEmpty() ? "(missing)" : "(present)")
+                   .arg(Config::get().baiduPaste);
+
+        BaiduTextResult t = BaiduTextTranslate::translate(
+            QStringLiteral("Hello, world"), QStringLiteral("en"), QStringLiteral("zh"),
+            appId, secret, 15000);
+        log << QString("text: ok=%1 code=%2 from=%3 to=%4 out=%5 err=%6")
+                   .arg(t.ok).arg(t.errorCode).arg(t.from, t.to,
+                        t.text.left(40).replace(QLatin1Char('\n'), QLatin1Char(' ')), t.error);
+
+        QImage img(400, 120, QImage::Format_RGB32);
+        {
+            img.fill(Qt::white);
+            QPainter p(&img);
+            p.setPen(Qt::black);
+            QFont f; f.setPixelSize(48); f.setBold(true);
+            p.setFont(f);
+            p.drawText(img.rect(), Qt::AlignCenter, QStringLiteral("Hello"));
+        }
+        BaiduPictureTranslate bd;
+        QElapsedTimer pt; pt.start();
+        BaiduResult r = bd.translate(img, QStringLiteral("auto"),
+                                     baiduLangCode(Config::get().translateTarget),
+                                     appId, secret, Config::get().baiduPaste, 30000);
+        const qint64 picMs = pt.elapsed();
+        log << QString("picture: ok=%1 code=%2 lines=%3 pasteImg=%4 %5ms err=%6")
+                   .arg(r.ok).arg(r.errorCode).arg(r.lines.size())
+                   .arg(!r.pasteImage.isNull()).arg(picMs).arg(r.error);
+        for (const auto& l : r.lines)
+            log << QString("  line: %1 -> %2").arg(l.src.left(40), l.dst.left(40));
+
+        // 托管模式：内置云代理可用时，空凭据（=无自配用户）实测一次代理链路
+        if (managed::available()) {
+            log << QString("managedProxy: %1").arg(managed::proxyUrl());
+            BaiduTextResult mt = BaiduTextTranslate::translate(
+                QStringLiteral("Hello, world"), QStringLiteral("en"), QStringLiteral("zh"),
+                QString(), QString());
+            log << QString("managed.text: ok=%1 out=%2 err=%3")
+                       .arg(mt.ok).arg(mt.text.left(30), mt.error);
+            BaiduPictureTranslate mp;
+            QElapsedTimer mpt; mpt.start();
+            BaiduResult mr = mp.translate(img, QStringLiteral("auto"),
+                                          baiduLangCode(Config::get().translateTarget),
+                                          QString(), QString(), Config::get().baiduPaste, 30000);
+            log << QString("managed.picture: ok=%1 code=%2 lines=%3 pasteImg=%4 %5ms err=%6")
+                       .arg(mr.ok).arg(mr.errorCode).arg(mr.lines.size())
+                       .arg(!mr.pasteImage.isNull()).arg(mpt.elapsed()).arg(mr.error);
+        }
+
+        QFile lf(out);
+        if (lf.open(QIODevice::WriteOnly)) {
+            QTextStream ts(&lf);
+            ts.setEncoding(QStringConverter::Utf8);
+            for (const QString& l : log) ts << l << "\n";
+            lf.close();
+        }
+        QTextStream(stdout) << log.join(QLatin1Char('\n')) << "\n";
+        return 0;
+    }
+
+    // 云代理托管自检：无凭据走代理（不得携带任何签名/凭据）、凭据存在时优先直连
+    int pxIdx = args.indexOf("--proxy-selftest");
+    if (pxIdx >= 0) {
+        QString out = (pxIdx + 1 < args.size()) ? args[pxIdx + 1] : "proxy_selftest.txt";
+        qputenv("TACKSHOT_MANAGED_PROXY", "http://127.0.0.1:8903");
+        QStringList log;
+        bool allPass = true;
+
+        auto proxyStats = []() -> QPair<int, bool> {
+            QNetworkAccessManager mgr;
+            QNetworkRequest req{QUrl("http://127.0.0.1:8903/stats")};
+            req.setTransferTimeout(5000);
+            QNetworkReply* rp = mgr.get(req);
+            QEventLoop loop;
+            QObject::connect(rp, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+            loop.exec();
+            const auto o = QJsonDocument::fromJson(rp->readAll()).object();
+            rp->deleteLater();
+            return {o["requests"].toInt(), o["last_had_creds"].toBool()};
+        };
+        auto textImage = []() {
+            QImage img(320, 120, QImage::Format_RGB32);
+            img.fill(Qt::white);
+            QPainter p(&img);
+            p.setPen(Qt::black);
+            QFont f; f.setPixelSize(28); f.setBold(true);
+            p.setFont(f);
+            p.drawText(img.rect(), Qt::AlignCenter, QStringLiteral("Hello"));
+            return img;
+        };
+
+        // 1) 图片翻译托管：空凭据 -> 代理，且请求不含凭据
+        BaiduPictureTranslate bd;
+        auto r1 = bd.translate(textImage(), QStringLiteral("auto"), QStringLiteral("zh"),
+                               QString(), QString(), 1);
+        const auto s1 = proxyStats();
+        bool p1 = r1.ok && r1.lines.size() == 2 && !r1.pasteImage.isNull() && !s1.second;
+        log << QString("picture: ok=%1 lines=%2 paste=%3x%4 credsLeaked=%5 pass=%6")
+                   .arg(r1.ok).arg(r1.lines.size())
+                   .arg(r1.pasteImage.width()).arg(r1.pasteImage.height())
+                   .arg(s1.second).arg(p1);
+        allPass &= p1;
+
+        // 2) 文本翻译托管
+        auto r2 = BaiduTextTranslate::translate(QStringLiteral("Hello\nProxy"),
+                                                QStringLiteral("auto"), QStringLiteral("zh"),
+                                                QString(), QString());
+        const auto s2 = proxyStats();
+        bool p2 = r2.ok && r2.text.split(QLatin1Char('\n')).size() == 2 && !s2.second;
+        log << QString("text: ok=%1 lines=%2 credsLeaked=%3 pass=%4")
+                   .arg(r2.ok).arg(r2.text.split(QLatin1Char('\n')).size())
+                   .arg(s2.second).arg(p2);
+        allPass &= p2;
+
+        // 3) 批量托管
+        ProviderPreset bp;
+        bp.id = QStringLiteral("baidu");
+        Config::get().baiduAppId = QString();   // 无用户凭据 -> 走代理
+        const int before = proxyStats().first;
+        auto r3 = TranslateClient().translateBatch(
+            {QStringLiteral("aa"), QStringLiteral("bb"), QStringLiteral("cc")},
+            QStringLiteral("简体中文"), bp, QString());
+        const auto s3 = proxyStats();
+        bool p3 = r3.failed == 0 && r3.lines.size() == 3
+                  && r3.lines[0].contains(QStringLiteral("【代】"))
+                  && (s3.first - before) == 1 && !s3.second;
+        log << QString("batch: failed=%1 lines=%2 requests=%3 credsLeaked=%4 pass=%5")
+                   .arg(r3.failed).arg(r3.lines.size()).arg(s3.first - before)
+                   .arg(s3.second).arg(p3);
+        allPass &= p3;
+
+        // 4) SimpleTex 托管：空 token -> 代理
+        SimpleTexClient st;
+        auto r4 = st.recognize(textImage(), QString(), true);
+        const auto s4 = proxyStats();
+        bool p4 = r4.ok && r4.latex.contains(QLatin1Char('=')) && !s4.second;
+        log << QString("simpletex: ok=%1 latex=%2 credsLeaked=%3 pass=%4")
+                   .arg(r4.ok).arg(r4.latex).arg(s4.second).arg(p4);
+        allPass &= p4;
+
+        // 5) 凭据优先级：用户凭据存在 -> 绕过代理直连（签名 mock 验证通过）
+        qputenv("TACKSHOT_BAIDU_ENDPOINT", "http://127.0.0.1:8902/picture");
+        const int beforeProxy = proxyStats().first;
+        auto r5 = bd.translate(textImage(), QStringLiteral("auto"), QStringLiteral("en"),
+                               QStringLiteral("appid-test"), QStringLiteral("secret-test"), 1);
+        const bool noProxyHit = proxyStats().first == beforeProxy;
+        bool p5 = r5.ok && r5.lines.size() == 2 && noProxyHit;
+        log << QString("priority: ok=%1 lines=%2 proxyUntouched=%3 pass=%4")
+                   .arg(r5.ok).arg(r5.lines.size()).arg(noProxyHit).arg(p5);
+        allPass &= p5;
+
+        log << QString("ALL_PASS=%1").arg(allPass ? "true" : "false");
+        QFile pf(out);
+        if (pf.open(QIODevice::WriteOnly)) {
+            QTextStream ts(&pf);
+            ts.setEncoding(QStringConverter::Utf8);
+            for (const QString& l : log) ts << l << "\n";
+            pf.close();
+        }
+        return allPass ? 0 : 25;
     }
 
     // DPI 自检：逐屏校验 物理=逻辑×dpr，以及覆盖层映射比例

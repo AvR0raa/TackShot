@@ -8,6 +8,18 @@ $env:PATH = "$tc\Tools\mingw1310_64\bin;$tc\bin;C:\Windows\System32;C:\Windows"
 New-Item -ItemType Directory -Force -Path $b | Out-Null
 Get-ChildItem $b -Filter *.o | Remove-Item -Force -ErrorAction SilentlyContinue
 
+# ---- 托管云代理注入：tools/proxy_local.json（不入库） -> src/proxy_embedded.inc ----
+$proxyUrl = ""
+$proxyFile = "$ws\tools\proxy_local.json"
+if (Test-Path $proxyFile) {
+  try { $proxyUrl = (Get-Content $proxyFile -Raw | ConvertFrom-Json).proxy_url } catch {}
+}
+$inc = "// 自动生成：build.ps1 从 tools/proxy_local.json 注入；勿手改、勿提交。`r`n" +
+       "static const char kManagedProxy[] = `"$proxyUrl`";`r`n"
+[IO.File]::WriteAllText("$src\proxy_embedded.inc", $inc)
+if ($proxyUrl) { Write-Output "=== managed proxy: $proxyUrl ===" }
+else { Write-Output "=== managed proxy: none (user-credential build) ===" }
+
 $ort = "$ws\toolchain\ort\onnxruntime-win-x64-1.31.1"
 $cxxflags = @(
   "-std=c++17", "-O2", "-fexceptions",

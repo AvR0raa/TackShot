@@ -1,5 +1,6 @@
-import base64, io, json, struct, zlib, threading
+import base64, hashlib, io, json, struct, zlib, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 STATE = {"requests": 0, "last_path": "", "last_has_image": False, "last_auth": ""}
 LOCK = threading.Lock()
@@ -49,7 +50,28 @@ class H(BaseHTTPRequestHandler):
             STATE["last_auth"] = self.headers.get("token", "")
 
         if "picture" in self.path:
-            if "error=sign" in self.path:
+            # 与真实 API 一致的鉴权：参数必须在 URL query 里且签名正确
+            # （1.8.1 曾因 setQuery 缺失导致参数全丢 -> 52003，mock 当时放过了 bug）
+            params = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            appid = params.get("appid", "")
+            if not appid:
+                self._json(200, {"error_code": "52003", "error_msg": "UNAUTHORIZED USER"})
+                return
+            start = raw.find(b"\x89PNG\r\n\x1a\n")
+            if start >= 0:
+                end = raw.find(b"IEND", start)
+                png = raw[start:end + 8] if end > start else b""
+            else:
+                start = raw.find(b"\xff\xd8\xff")
+                end = raw.find(b"\r\n--", start) if start >= 0 else -1
+                png = raw[start:end] if start >= 0 and end > start else b""
+            if not png:
+                self._json(200, {"error_code": "69007", "error_msg": "bad image"})
+                return
+            expect = hashlib.md5((appid + hashlib.md5(png).hexdigest()
+                                  + params.get("salt", "") + params.get("cuid", "")
+                                  + params.get("mac", "") + "secret-test").encode()).hexdigest()
+            if params.get("sign", "") != expect:
                 self._json(200, {"error_code": "54001", "error_msg": "Invalid Sign"})
                 return
             self._json(200, {

@@ -25,3 +25,8 @@ config.json
 secrets.dat
 translate_cache.jsonl
 capture.log
+
+# 云代理注入（本地构建凭据，绝不入库）
+tools/cred_local.json
+tools/proxy_local.json
+src/proxy_embedded.inc

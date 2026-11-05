@@ -1,5 +1,6 @@
 #include "config.h"
 #include "common.h"
+#include "secrets.h"
 #include <windows.h>
 #include <QStandardPaths>
 #include <QDir>
@@ -153,6 +154,11 @@ void Config::load() {
     } else {
         save();
     }
+    // 1.8 迁移：旧默认 deepseek 且已配置百度凭据 -> 改用百度（与识别共用 APPID）
+    if (translateProvider == QStringLiteral("deepseek")
+        && !baiduAppId.trimmed().isEmpty()
+        && !secrets::load("baidu_secret").isEmpty())
+        translateProvider = QStringLiteral("baidu");
     if (saveDir.isEmpty())
         saveDir = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation) + "/TackShot";
 }

@@ -339,6 +339,13 @@ QWidget* OcrDialog::makeBody() {
     m_tabs->addTab(makeTextPage(), QStringLiteral("文字"));
     m_tabs->addTab(makeTranslatedPage(), QStringLiteral("译文"));
     m_tabs->addTab(makeLatexPage(), QStringLiteral("LaTeX"));
+    // 公式识别懒加载：首次切到 LaTeX 页才发起（识别主流程不再等待公式）
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
+        if (index == 2 && !m_latexAsked) {
+            m_latexAsked = true;
+            emit latexRequested();
+        }
+    });
 
     m_split->addWidget(m_preview);
     m_split->addWidget(m_tabs);
@@ -404,7 +411,7 @@ QWidget* OcrDialog::makeLatexPage() {
     m_latexEdit->setReadOnly(true);
     m_latexEdit->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_latexEdit->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
-    m_latexEdit->setPlaceholderText(QStringLiteral("该图未检测到公式"));
+    m_latexEdit->setPlaceholderText(QStringLiteral("打开本页时自动识别公式"));
     lay->addWidget(m_latexEdit);
     return page;
 }

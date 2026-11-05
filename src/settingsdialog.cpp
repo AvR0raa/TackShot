@@ -5,6 +5,7 @@
 #include "secrets.h"
 #include "theme.h"
 #include "vision.h"
+#include "managed.h"
 
 #include <QLabel>
 #include <QApplication>
@@ -180,6 +181,12 @@ QWidget* SettingsDialog::makeOcrPage() {
         "· 公式：SimpleTex——输出 LaTeX\n"
         "· 兜底：视觉大模型（OpenAI 兼容）")));
 
+    // 内置云代理（L2）：密钥在云端，下面的凭据留空即走公共额度
+    if (managed::available())
+        form->addRow(QString(), subLabel(QStringLiteral(
+            "★ 已内置云代理：以下凭据全部留空即可直接使用（走公共额度）；"
+            "填写你自己的凭据后将优先直连官方接口。")));
+
     // ---- 百度 ----
     form->addRow(QString(), titleLabel(QStringLiteral("百度图片翻译")));
 
@@ -198,12 +205,12 @@ QWidget* SettingsDialog::makeOcrPage() {
     m_baiduPaste = new QComboBox(this);
     m_baiduPaste->addItem(QStringLiteral("整图贴合（推荐，返回翻译好的整张图）"), 1);
     m_baiduPaste->addItem(QStringLiteral("分块贴合（返回每块的小图）"), 2);
-    m_baiduPaste->addItem(QStringLiteral("关闭贴合（只要文字和坐标）"), 0);
+    m_baiduPaste->addItem(QStringLiteral("关闭贴合（仅本地回填）"), 0);
     {
         int idx = m_baiduPaste->findData(Config::get().baiduPaste);
         m_baiduPaste->setCurrentIndex(idx >= 0 ? idx : 0);
     }
-    form->addRow(QStringLiteral("贴合"), m_baiduPaste);
+    form->addRow(QStringLiteral("译图贴合"), m_baiduPaste);
     connect(m_baiduPaste, &QComboBox::currentIndexChanged, this, [this]() { scheduleApply(); });
 
     auto* baiduHint = subLabel(QStringLiteral(
@@ -329,6 +336,10 @@ QWidget* SettingsDialog::makeTranslatePage() {
     }
     form->addRow(QStringLiteral("引擎"), m_trProvider);
 
+    form->addRow(QString(), subLabel(QStringLiteral(
+        "引擎选「百度翻译」时，凭据复用「识别」页的百度 APPID/密钥"
+        "（需在开放平台开通通用文本翻译，免费标准版限 1 次/秒；术语表只对大模型引擎生效）。")));
+
     m_trBase = new QLineEdit(Config::get().translateBaseUrl, this);
     m_trModel = new QLineEdit(Config::get().translateModel, this);
     m_trKey = new QLineEdit(this);
@@ -361,13 +372,26 @@ QWidget* SettingsDialog::makeTranslatePage() {
     auto applyPreset = [this](bool force) {
         QString id = m_trProvider->currentData().toString();
         ProviderPreset p = TranslateClient::presetById(id);
-        if (force || m_trBase->text().isEmpty()) m_trBase->setText(p.baseUrl);
-        if (force || m_trModel->text().isEmpty()) m_trModel->setText(p.model);
-        QString k = secrets::load("translate_api_key_" + id);
-        if (!k.isEmpty()) m_trKey->setText(k);
+        const bool isBaidu = (id == QStringLiteral("baidu"));
+        m_trBase->setEnabled(!isBaidu);
+        m_trModel->setEnabled(!isBaidu);
+        m_trKey->setEnabled(!isBaidu);
+        if (isBaidu) {
+            m_trBase->clear();
+            m_trModel->clear();
+            m_trKey->clear();
+            m_trKey->setPlaceholderText(QStringLiteral("复用「识别」页的百度密钥"));
+        } else {
+            m_trKey->setPlaceholderText(QStringLiteral("留空则不启用翻译"));
+            if (force || m_trBase->text().isEmpty()) m_trBase->setText(p.baseUrl);
+            if (force || m_trModel->text().isEmpty()) m_trModel->setText(p.model);
+            QString k = secrets::load("translate_api_key_" + id);
+            if (!k.isEmpty()) m_trKey->setText(k);
+        }
         scheduleApply();
     };
     connect(m_trProvider, &QComboBox::currentIndexChanged, this, [applyPreset](int) { applyPreset(true); });
+    applyPreset(false);  // 初始归一：百度引擎时禁用 Base URL/模型/Key 三行
     connect(m_trBase, &QLineEdit::textEdited, this, [this]() { scheduleApply(); });
     connect(m_trModel, &QLineEdit::textEdited, this, [this]() { scheduleApply(); });
     connect(m_trKey, &QLineEdit::textEdited, this, [this]() { scheduleApply(); });
@@ -421,12 +445,16 @@ QWidget* SettingsDialog::makeTranslatePage() {
         applyNow();
         m_trStatus->setText(QStringLiteral("测试中…"));
         QApplication::processEvents();
+        const QString pid = m_trProvider->currentData().toString();
         ProviderPreset p;
-        p.id = m_trProvider->currentData().toString();
+        p.id = pid;
         p.baseUrl = m_trBase->text().trimmed();
         p.model = m_trModel->text().trimmed();
+        // 百度：密钥取「识别」页的 DPAPI 存储
+        const QString key = (pid == QStringLiteral("baidu"))
+                                ? secrets::load("baidu_secret") : m_trKey->text().trimmed();
         TranslateClient client;
-        auto r = client.testConnection(p, m_trKey->text().trimmed());
+        auto r = client.testConnection(p, key);
         m_trStatus->setText(r.ok ? QStringLiteral("连接成功：%1").arg(r.text.left(40))
                                  : QStringLiteral("连接失败：%1").arg(r.error));
     });

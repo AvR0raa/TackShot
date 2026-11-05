@@ -1,4 +1,6 @@
 #include "simpletex.h"
+#include "managed.h"
+#include "baidu.h"
 
 #include <QBuffer>
 #include <QEventLoop>
@@ -16,42 +18,56 @@ SimpleTexResult SimpleTexClient::recognize(const QImage& img, const QString& tok
                                            bool light, int timeoutMs) {
     SimpleTexResult res;
     if (img.isNull()) { res.error = QStringLiteral("图片为空"); return res; }
-    if (token.trimmed().isEmpty()) {
-        res.error = QStringLiteral("未配置 SimpleTex Token（设置 → 识别）");
+    // 托管模式：无用户 Token 但内置了云代理 -> Token 由云端补齐
+    const bool viaProxy = token.trimmed().isEmpty() && managed::available();
+    if (token.trimmed().isEmpty() && !viaProxy) {
+        res.error = QStringLiteral("未配置 SimpleTex Token（设置 → 识别），且无内置云代理");
         return res;
     }
 
-    QByteArray png;
-    {
-        QImage conv = img;
-        if (conv.width() > 2048 || conv.height() > 2048)
-            conv = conv.scaled(2048, 2048, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        QBuffer buf(&png);
-        buf.open(QIODevice::WriteOnly);
-        conv.save(&buf, "PNG");
-    }
+    // SimpleTex 建议最长边 <=2048；小图 PNG 无损 / 大图 JPG 压缩（上传提速）
+    QImage conv = img;
+    if (conv.width() > 2048 || conv.height() > 2048)
+        conv = conv.scaled(2048, 2048, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    const QByteArray png = encodeImageForUpload(conv, 2000 * 1024);
+    if (png.isEmpty()) { res.error = QStringLiteral("图片编码失败"); return res; }
 
     QString url = light ? QStringLiteral("https://server.simpletex.cn/api/latex_ocr_turbo")
                         : QStringLiteral("https://server.simpletex.cn/api/latex_ocr");
     const QString override = qEnvironmentVariable("TACKSHOT_SIMPLETEX_ENDPOINT");
     if (!override.isEmpty()) url = override;
-
-    auto* multi = new QHttpMultiPart(QHttpMultiPart::FormDataType);
-    QHttpPart filePart;
-    filePart.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("image/png"));
-    filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
-                       QStringLiteral("form-data; name=\"file\"; filename=\"tackshot.png\""));
-    filePart.setBody(png);
-    multi->append(filePart);
+    if (viaProxy)
+        url = managed::endpoint(QStringLiteral("simpletex"))
+              + (light ? QStringLiteral("?light=1") : QStringLiteral("?light=0"));
 
     QNetworkRequest req{QUrl(url)};
     req.setTransferTimeout(timeoutMs);
-    req.setRawHeader("token", token.trimmed().toUtf8());
-    req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("TackShot/1.7"));
+    if (!viaProxy)   // 托管：Token 由云代理补齐，客户端不发
+        req.setRawHeader("token", token.trimmed().toUtf8());
+    req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("TackShot/1.9"));
 
     QNetworkAccessManager mgr;
-    QNetworkReply* reply = mgr.post(req, multi);
-    multi->setParent(reply);
+    QNetworkReply* reply = nullptr;
+    if (viaProxy) {
+        // 托管：JSON + base64（网关对二进制 multipart 有损解码）
+        QJsonObject jo;
+        jo["image"] = QString::fromLatin1(png.toBase64());
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        reply = mgr.post(req, QJsonDocument(jo).toJson(QJsonDocument::Compact));
+    } else {
+        auto* multi = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+        QHttpPart filePart;
+        const bool isJpg = png.startsWith("\xFF\xD8\xFF");
+        filePart.setHeader(QNetworkRequest::ContentTypeHeader,
+                           isJpg ? QStringLiteral("image/jpeg") : QStringLiteral("image/png"));
+        filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                           isJpg ? QStringLiteral("form-data; name=\"file\"; filename=\"tackshot.jpg\"")
+                                 : QStringLiteral("form-data; name=\"file\"; filename=\"tackshot.png\""));
+        filePart.setBody(png);
+        multi->append(filePart);
+        reply = mgr.post(req, multi);
+        multi->setParent(reply);
+    }
 
     QEventLoop loop;
     QTimer timer;

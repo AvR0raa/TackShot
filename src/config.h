@@ -23,7 +23,7 @@ public:
     QString recordAudio = "system"; // none / system / mic / both
 
     // 翻译
-    QString translateProvider = "deepseek";   // deepseek / gemini / custom
+    QString translateProvider = "baidu";      // baidu / deepseek / gemini / custom
     QString translateBaseUrl;                  // 空 = 用预设
     QString translateModel;                    // 空 = 用预设
     QString translateSource = "English";       // 源语言（默认英文，可设“自动检测”）

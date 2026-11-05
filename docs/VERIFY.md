@@ -297,3 +297,194 @@ err=32 = ERROR_SHARING_VIOLATION —— TackShot 正在运行，安装器无法�
 ### 安装包
 - 183.08 MB（新增 114MB 公式模型），安装后 38 个文件、models 9 个
 - 安装目录内跑 --formula-selftest：ready=true，latex 正确
+
+## 25. 1.8.0：翻译改百度通用文本翻译（与识别共用凭据）
+
+### 实现
+- `BaiduTextTranslate`（baidu.cpp）：`/api/trans/vip/translate`，sign=md5(appid+q+salt+密钥)，
+  表单 POST；54003/52001/52002 自动等待 1.1s 重试（标准版 QPS=1），最多 3 次；
+  错误码映射中文提示；`TACKSHOT_BAIDU_TEXT_ENDPOINT` 可覆盖端点（自检用）
+- `TranslateClient::doRequest` 按 `p.id=="baidu"` 分发：appId 取 Config、密钥取
+  DPAPI `baidu_secret`（即「识别」页凭据），语言名 -> 语言码复用 `baiduLangCode`
+  （自 overlay.cpp 的 toBaiduLang 移出共享）
+- 引擎预设新增 `baidu` 并设为默认；1.7 存量配置若 provider=deepseek 且已配置
+  百度凭据，load() 时自动迁移到 baidu
+- 识别结果弹窗：配置了百度凭据即视为在线可用（原来必须填 OpenAI Key，
+  导致只配百度时「翻译/译图」按钮一直灰）；buildChain 支持 baidu 条目
+- 设置 → 翻译：引擎选百度时 Base URL/模型/API Key 三行禁用并清空，
+  Key 占位符提示「复用『识别』页的百度密钥」；测试连接走百度密钥
+
+### 自检（mock_translate_server.py 新增 /baidu 路由：表单签名校验、54003、54001）
+命令：`TackShot.exe --baidu-text-selftest http://127.0.0.1:8899/baidu build\baidu_text_report.txt`
+
+    normal: ok=1 lines=2 text=【中】Hello, world… pass=1     （多行逐行返回）
+    badSign: ok=0 code=54001 err=…（签名错误…） pass=1
+    limit54003: ok=1 pass=1                                    （限流重试成功）
+    dispatch: ok=1 provider=baidu pass=1                       （TranslateClient 分发+语言码映射）
+    unconfigured: ok=0 err=百度翻译未配置 APPID/密钥 pass=1
+    ALL_PASS=true
+
+OpenAI 路径回归 `--translate-selftest`：7/7 ALL_PASS=true（未受影响）。
+UI：--ui-preview 翻译页截图确认三框禁用、无 baidu-text 残留。
+
+### 注意
+- 需在百度翻译开放平台分别开通「通用文本翻译」与「图片翻译」（同一 APPID/密钥）；
+- 术语表只对大模型引擎生效（百度 MT 不支持注入术语）。
+
+## 26. 1.8.0 补丁：翻译批量提速 + 译图 52003 定位
+
+### 翻译慢的根因与修复
+- 原因：识别结果弹窗里「翻译/译图」逐行发请求（每行 1 次 HTTP），百度标准版 QPS=1，
+  N 行 ≥N 秒且易触发 54003 重试等待
+- 修复：`TranslateClient::translateBatch`——百度引擎把全部行以 \n 合并成一次请求
+  （trans_result 按行返回），超 5000 字节自动分批、批间限速 1.1s；OpenAI 引擎仍逐行；
+  主引擎失败行由备用引擎补齐
+- 自检 case6：3 行批量 -> mock 请求数 +1（一次请求），pass
+
+### 译图无法使用的定位（--baidu-live-check 真实 API 诊断）
+    appId=2025REDACTED0009 secret=(present) paste=1
+    text: ok=1 out=你好，世界                     （通用文本翻译正常）
+    picture: ok=0 code=52003 UNAUTHORIZED USER    （图片翻译服务未开通）
+
+结论：APPID 只开通了「通用文本翻译」，未开通「图片翻译」（开放平台两个独立开关）。
+识别失败弹窗已加 52003 引导文案。
+
+### 备注
+- live-check 在受限环境跑时 %LOCALAPPDATA% 被重定向到 LocalLow 会读到空配置，
+  需 TACKSHOT_DATA_DIR 指向真实数据目录；GUI 不受影响
+
+## 27. 1.8.1：图片翻译 52003 真正根因——setQuery 缺失（更正 §26 结论）
+
+### 更正
+§26 判定的「图片翻译服务未开通」是**误判**。用户控制台已开通；真实根因是客户端 bug。
+
+### 根因
+`baidu.cpp` BaiduPictureTranslate：QUrlQuery 构建了全部鉴权参数（appid/sign/salt/cuid/mac/
+version/paste）但**从未 url.setQuery(q) 挂回 URL**，参数全部丢弃，百度收到无 appid 的裸请求
+-> 52003 UNAUTHORIZED USER。该 bug 自 1.7.0 引入；旧 mock 的 picture 路由不校验参数，
+返回固定成功响应，所以 --cloud-selftest 一直"全过"。
+
+### 定位过程
+- tools/baidu_probe.py（DPAPI 解密凭据 + 直发真实 API）：参数放 query 的请求返回
+  69004（鉴权通过、识别为空，测试图无文字）——证明服务与签名公式没问题
+- 同凭据 app 内请求返回 52003 —— 对比出"参数没发出去"
+
+### 修复与防回归
+- baidu.cpp:75 补 `url.setQuery(q)`
+- mock_cloud_server.py picture 路由加严格校验：query 缺 appid -> 52003；
+  sign != md5(appid+md5(png)+salt+cuid+mac+secret-test) -> 54001；提取 PNG 算真实签名
+- 反向验证：注释 setQuery 重编译 -> --cloud-selftest exit=24（baidu pass=0，mock 拦住）；
+  恢复 -> ALL_PASS=true
+
+### 真实 API 验证（--baidu-live-check，用户真实凭据）
+    text: ok=1 out=你好，世界
+    picture: ok=1 code=0 lines=1 pasteImg=1
+      line: Hello -> 你好
+
+## 28. 1.9.0：L2 云代理托管——密钥只存云端，安装包只有代理 URL
+
+### 架构
+- cloud/worker.js（Cloudflare Workers）与 cloud/scf_main.py（腾讯云函数）等价实现：
+  /picture /text /simpletex 三路由，接收客户端业务参数，云端补 appid/salt/sign（或 token）
+- 客户端 src/managed.cpp：内置代理 URL 由 build.ps1 从 tools/proxy_local.json 生成
+  src/proxy_embedded.inc（gitignore）；环境变量 TACKSHOT_MANAGED_PROXY 可覆盖
+- 优先级：用户自配凭据（设置→识别）> 内置云代理；凭据空且无代理 -> 明确报错
+- 托管请求只含 from/to/paste 或 q/from/to，**不含任何签名/凭据字段**
+
+### 自检 --proxy-selftest（mock_proxy_server.py:8903 + mock_cloud_server.py:8902）
+    picture: ok=1 lines=2 paste=60x30 credsLeaked=0 pass=1
+    text:    ok=1 lines=2 credsLeaked=0 pass=1
+    batch:   failed=0 lines=3 requests=1 credsLeaked=0 pass=1
+    simpletex: ok=1 latex=E = m c^{2} credsLeaked=0 pass=1
+    priority: ok=1 lines=2 proxyUntouched=1 pass=1   （有凭据时直连，代理零请求）
+    ALL_PASS=true
+
+credsLeaked=0 由 mock 断言（请求里出现 appid/sign/salt/token 头任一即置位）。
+
+### 回归
+--cloud-selftest / --translate-selftest / --baidu-text-selftest / --ui-preview 全部
+ALL_PASS（托管不影响直连与 OpenAI 路径）。worker.js 内嵌 MD5 对拍 node crypto：
+空串/中文/200 字符/63-65 边界长度全 OK。
+
+### 发布安全
+- GitHub 源码：proxy_embedded.inc 为空模板（.gitignore 排除生成版本），无 URL 无密钥
+- 全历史扫描无凭据（唯一命中为 manifest 模板 publicKeyToken）
+- docs/VERIFY.md 中历史调试 APPID 已脱敏
+
+## 29. 1.9.0 补充：腾讯云函数 URL 实测三坑与 JSON 协议终局
+
+### 踩坑记录（腾讯云 SCF + 函数 URL，均与文档不符，以实测为准）
+1. 环境变量注入进程 os.environ（不在 context 对象上）
+2. event.queryString 是解析好的 dict（不是文档写法的原始字符串）
+3. 二进制 multipart body 被网关按 UTF-8 强行解码，无效字节替换为 U+FFFD，
+   图片有损不可恢复（dbg 字段实测：bodyLen 749 << 实际体积）
+
+### 终局协议：图片走 JSON + base64
+客户端托管模式发 {"image": "<base64>"} + query 参数；云端（scf_main.py extract_image /
+worker.js readImageBytes）解码后构造 multipart 转发百度。text 路由不受影响（纯表单）。
+
+### 真实代理验证（--baidu-live-check，腾讯云广州 + 用户真实凭据云端签名）
+    text:    ok=1 out=你好，世界
+    picture: ok=1 code=0 lines=1 pasteImg=1  (Hello -> 你好)
+    simpletex: ok=1 latex=\mathrm{HELO}      （合成字模图）
+    托管模式（空凭据走内置代理）：text/picture 均 ok=1
+
+### 客户端自检
+--proxy-selftest 5/5（credsLeaked=0，JSON 协议）；--cloud-selftest 直连回归通过；
+本地 SCF 事件级测试 tools/test_scf_local.py 8/8（含 queryString-dict、JSON、latin1 兜底）。
+
+## 30. 1.9.0 补充：识图提速（并行 + 智能压缩）
+
+### 慢因
+1. 串行链路：SimpleTex 公式识别与百度图片翻译先后各等一次网络往返（各 1~3s）
+2. 截图固定 PNG 无损：真实屏幕截图常 1~2MB，云代理链路再 +33% base64 膨胀
+
+### 优化
+- overlay onOcr：公式/百度两条云端调用 QThreadPool 并行，总耗时=max(两者)；
+  主线程轮询 processEvents 保持响应（90s 兜底）
+- encodeImageForUpload（baidu.h 导出）：≤300KB 用 PNG 无损；大图 JPG q85→70→55
+  递降，仍超限按 0.75 缩放重试。托管上限 2.5MB / 直连 3.9MB；SimpleTex 沿用
+  （2048 长边 + 2MB 上限）。multipart Content-Type/文件名按魔数自适应
+- 自检适配：内置托管可用后「空凭据=报错」语义过时——cloud/baidu-text 自检开头
+  TACKSHOT_MANAGED_PROXY=off 强制直连语义；managed 支持 "off" 显式禁用值
+
+### 实测（live-check，400x120 合成小图）
+    直连 picture 922ms / 托管 picture 1292ms（代理一跳 +370ms；服务端固有 ~900ms）
+    --proxy-selftest 5/5、--cloud-selftest、--baidu-text-selftest、--translate-selftest
+    回归全过；mock 支持 JPG 魔数
+
+## 31. 1.9.0 补充：安装器 UI 更新
+
+- 标题：硬编码 1.0.0 -> 动态引用 src/common.h 的 APP_VERSION（WIDEN 宏转宽字符，
+  以后 bump 版本安装器自动同步）
+- 副标题：「本地截图/标注/贴图工具（无网络依赖）」（1.0 时代文案）->
+  「截图 / 标注 / 贴图 / 录屏，云识别翻译开箱即用」
+- 新增灰色小字提示行（WM_CTLCOLORSTATIC 上色）：「识图/翻译走云端（密钥云端保管）·
+  热键 Ctrl+Alt+A」；按钮下移、窗口 478x240 -> 478x258
+- 图标修复：app.rc 的 IDI_ICON1（字符串符号）改数字 ID 1，安装器窗口/任务栏现在
+  正确显示 TackShot 图标
+- manifest assemblyIdentity 版本 1.0.0.0 -> 1.9.0.0
+- 布局校验：副标题/小字按 -16/-13 字宽计算均 <430px 控件宽，无截断；
+  PrintWindow 首轮截图确认标题、版本号、图标正常
+
+## 32. 1.9.0 补充：识别/译图功能拆分 + 安装器精简
+
+### 拆分（用户需求：识别太慢、两功能分开）
+- 旧流程：识别 = SimpleTex 公式 + 百度图片翻译(带贴合渲染) 全都跑，即使图里没公式
+  也要多一路上传识别；贴合渲染（paste=1）在百度服务端拖慢响应
+- 新流程：
+  · 识别（快）：只调百度图片翻译，paste=0 不渲染贴合图 -> 只要文字/坐标/译文
+  · 公式：懒加载——结果窗口切到 LaTeX 页签才调 SimpleTex（latexRequested 信号，
+    OcrDialog m_latexAsked 一次性）
+  · 译图（独立）：点「译图」才按设置里的贴合方式再调一次百度，钉整图贴合结果；
+    失败降级为坐标本地回填
+- 设置页「贴合」改名「译图贴合」，文案注明仅译图时生效
+- overlay 的 QThreadPool 并行框架随单路化移除（回简单同步结构）
+
+### 安装器精简（用户需求：删无关信息）
+- 删副标题与灰色小字提示行，仅保留：标题+版本 / 安装位置 / 进度 / 状态 / 安装取消
+- 窗口 478x258 -> 478x236；动态版本号与图标修复保留（§31）
+
+### 回归
+--proxy-selftest 5/5、--cloud-selftest、--baidu-text-selftest、--translate-selftest、
+--ocr-dialog-preview 全部通过

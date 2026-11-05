@@ -57,6 +57,7 @@ signals:
     void translateRequested();
     void imageTranslateRequested();
     void copyRequested(const QString& text);
+    void latexRequested();   // 首次切到 LaTeX 页时发出（公式识别懒加载）
 
 protected:
     void showEvent(QShowEvent* e) override;
@@ -86,6 +87,7 @@ private:
     bool m_busy = false;
     bool m_online = true;
     bool m_shown = false;
+    bool m_latexAsked = false;
 
     QWidget*    m_header = nullptr;
     QWidget*    m_footer = nullptr;

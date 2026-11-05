@@ -13,6 +13,11 @@
 #include <cstdio>
 #include <cstdarg>
 
+// 版本号与主程序共用（src/common.h 的 APP_VERSION）
+#include "../src/common.h"
+#define WIDEN2(x) L##x
+#define WIDEN(x)  WIDEN2(x)
+
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -378,37 +383,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         g_font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        HWND hTitle = CreateWindowW(L"STATIC", L"TackShot 图钉截图  1.0.0", WS_CHILD | WS_VISIBLE,
+        HWND hTitle = CreateWindowW(L"STATIC", L"TackShot 图钉截图  " WIDEN(APP_VERSION), WS_CHILD | WS_VISIBLE,
                                     24, 20, 400, 28, hwnd, nullptr, nullptr, nullptr);
         HFONT big = CreateFontW(-24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
         SendMessageW(hTitle, WM_SETFONT, (WPARAM)big, TRUE);
 
-        HWND hInfo = CreateWindowW(L"STATIC", L"本地截图 / 标注 / 贴图工具（无网络依赖）", WS_CHILD | WS_VISIBLE,
-                                   24, 54, 400, 22, hwnd, nullptr, nullptr, nullptr);
-        SetFont(hInfo);
         HWND hPathLabel = CreateWindowW(L"STATIC", L"安装位置：", WS_CHILD | WS_VISIBLE,
-                                        24, 86, 70, 22, hwnd, nullptr, nullptr, nullptr);
+                                        24, 72, 70, 22, hwnd, nullptr, nullptr, nullptr);
         SetFont(hPathLabel);
         g_pathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", InstallRoot().c_str(),
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                     92, 84, 270, 24, hwnd, (HMENU)10, nullptr, nullptr);
+                                     92, 70, 270, 24, hwnd, (HMENU)10, nullptr, nullptr);
         SetFont(g_pathEdit);
         HWND browse = CreateWindowW(L"BUTTON", L"浏览…", WS_CHILD | WS_VISIBLE,
-                                    370, 84, 84, 24, hwnd, (HMENU)3, nullptr, nullptr);
+                                    370, 70, 84, 24, hwnd, (HMENU)3, nullptr, nullptr);
         SetFont(browse);
 
         g_progress = CreateWindowW(PROGRESS_CLASSW, nullptr, WS_CHILD | WS_VISIBLE,
-                                   24, 118, 430, 18, hwnd, nullptr, nullptr, nullptr);
+                                   24, 104, 430, 18, hwnd, nullptr, nullptr, nullptr);
         g_status = CreateWindowW(L"STATIC", L"准备就绪", WS_CHILD | WS_VISIBLE,
-                                 24, 144, 430, 22, hwnd, nullptr, nullptr, nullptr);
+                                 24, 130, 430, 22, hwnd, nullptr, nullptr, nullptr);
         SetFont(g_status);
 
         g_btn = CreateWindowW(L"BUTTON", L"安装", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                              300, 190, 80, 30, hwnd, (HMENU)1, nullptr, nullptr);
+                              300, 180, 80, 30, hwnd, (HMENU)1, nullptr, nullptr);
         SetFont(g_btn);
         HWND cancel = CreateWindowW(L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE,
-                                    388, 190, 80, 30, hwnd, (HMENU)2, nullptr, nullptr);
+                                    388, 180, 80, 30, hwnd, (HMENU)2, nullptr, nullptr);
         SetFont(cancel);
         return 0;
     }
@@ -524,7 +526,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
     RegisterClassExW(&wc);
 
-    RECT rc{ 0, 0, 478, 240 };
+    RECT rc{ 0, 0, 478, 236 };
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     HWND hwnd = CreateWindowExW(0, L"TackShotSetupWnd", L"TackShot 安装程序",
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,

@@ -1,5 +1,8 @@
 #include "translate.h"
 #include "config.h"
+#include "baidu.h"
+#include "managed.h"
+#include "secrets.h"
 
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
@@ -92,6 +95,9 @@ TranslateClient::TranslateClient(QObject* parent) : QObject(parent) {}
 
 QVector<ProviderPreset> TranslateClient::presets() {
     return {
+        {"baidu", QStringLiteral("百度翻译（与识别共用 APPID）"),
+         QString(), QStringLiteral("baidu-text"),
+         QStringLiteral("复用「识别」页的百度 APPID/密钥；标准版限 1 次/秒")},
         {"deepseek", QStringLiteral("DeepSeek（中英推荐）"),
          QStringLiteral("https://api.deepseek.com"), QStringLiteral("deepseek-flash"),
          QStringLiteral("中英互译质量最好，按 token 计费")},
@@ -219,6 +225,79 @@ TranslateResult TranslateClient::translateLine(const QString& text, const QStrin
     return doRequest(text, targetLang, p, apiKey, 30000, false, glossary, sourceLang);
 }
 
+TranslateClient::BatchResult TranslateClient::translateBatch(
+        const QStringList& lines, const QString& targetLang, const ProviderPreset& p,
+        const QString& apiKey, const QString& glossary, const QString& sourceLang,
+        const std::function<void(int, int)>& progress) {
+    BatchResult res;
+    res.lines = QStringList(lines.size(), QString());
+    if (lines.isEmpty()) return res;
+
+    // 百度：多行合并成一次请求（\n 分隔，trans_result 按行返回）；超 5000 字节分批
+    if (p.id == QStringLiteral("baidu")) {
+        Config& c = Config::get();
+        const QString appId = c.baiduAppId.trimmed();
+        const QString secret = !apiKey.trimmed().isEmpty() ? apiKey.trimmed()
+                                                           : secrets::load("baidu_secret");
+        if ((appId.isEmpty() || secret.isEmpty()) && !managed::available()) {
+            res.failed = lines.size();
+            res.error = QStringLiteral("百度翻译未配置 APPID/密钥（设置 → 识别），且无内置云代理");
+            return res;
+        }
+        const QString from = baiduLangCode(sourceLang);
+        const QString to = baiduLangCode(targetLang);
+
+        struct Batch { QVector<int> idx; QStringList rows; int bytes = 0; };
+        QVector<Batch> batches;
+        int total = 0;
+        for (int i = 0; i < lines.size(); ++i) {
+            const QString t = lines[i].trimmed();
+            if (t.isEmpty()) continue;   // 空行不发送（百度会丢弃导致错位）
+            const int bytes = t.toUtf8().size() + 1;
+            if (batches.isEmpty() || batches.last().bytes + bytes > 5000)
+                batches.append(Batch());
+            batches.last().idx.append(i);
+            batches.last().rows << t;
+            batches.last().bytes += bytes;
+            ++total;
+        }
+        if (total == 0) { res.error = QStringLiteral("没有可翻译的内容"); return res; }
+
+        int done = 0;
+        for (int bi = 0; bi < batches.size(); ++bi) {
+            if (bi > 0) QThread::msleep(1100);   // 标准版 QPS=1
+            const BaiduTextResult r = BaiduTextTranslate::translate(
+                batches[bi].rows.join(QLatin1Char('\n')), from, to, appId, secret);
+            if (r.ok) {
+                const QStringList dst = r.text.split(QLatin1Char('\n'));
+                for (int k = 0; k < batches[bi].idx.size(); ++k) {
+                    const QString v = (k < dst.size()) ? dst[k] : QString();
+                    res.lines[batches[bi].idx[k]] = v;
+                    if (v.isEmpty()) ++res.failed; else ++done;
+                }
+            } else {
+                res.failed += batches[bi].idx.size();
+                if (res.error.isEmpty()) res.error = r.error;
+            }
+            if (progress) progress(done, total);
+        }
+        return res;
+    }
+
+    // OpenAI 兼容引擎：内部逐行
+    for (int i = 0; i < lines.size(); ++i) {
+        const TranslateResult r = translateLine(lines[i], targetLang, p, apiKey,
+                                                glossary, sourceLang);
+        res.lines[i] = r.ok ? r.text : QString();
+        if (!r.ok) {
+            ++res.failed;
+            if (res.error.isEmpty()) res.error = r.error;
+        }
+        if (progress) progress(i + 1, lines.size());
+    }
+    return res;
+}
+
 TranslateResult TranslateClient::testConnection(const ProviderPreset& p, const QString& apiKey) {
     return doRequest(QStringLiteral("Hello, world"), QStringLiteral("简体中文"),
                      p, apiKey, 20000, false, QString());
@@ -231,6 +310,26 @@ TranslateResult TranslateClient::doRequest(const QString& text, const QString& t
     TranslateResult res;
     res.providerId = p.id;
     res.model = p.model;
+
+    // 百度通用文本翻译：不走 OpenAI 协议，apiKey 传入的是百度密钥（留空则取 DPAPI 存储）；
+    // 无用户凭据但有内置云代理时，BaiduTextTranslate 内部自动走托管模式
+    if (p.id == QStringLiteral("baidu")) {
+        Config& c = Config::get();
+        const QString appId = c.baiduAppId.trimmed();
+        const QString secret = !apiKey.trimmed().isEmpty() ? apiKey.trimmed()
+                                                           : secrets::load("baidu_secret");
+        if ((appId.isEmpty() || secret.isEmpty()) && !managed::available()) {
+            res.error = QStringLiteral("百度翻译未配置 APPID/密钥（设置 → 识别），且无内置云代理");
+            return res;
+        }
+        const BaiduTextResult r = BaiduTextTranslate::translate(
+            text, baiduLangCode(sourceLang), baiduLangCode(targetLang), appId, secret);
+        res.ok = r.ok;
+        res.text = r.text;
+        res.error = r.error;
+        res.attempts = 1;
+        return res;
+    }
 
     QString endpoint = p.baseUrl;
     while (endpoint.endsWith('/')) endpoint.chop(1);

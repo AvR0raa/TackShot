@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QHash>
 #include <QVector>
+#include <functional>
 
 struct ProviderPreset {
     QString id;
@@ -66,6 +67,19 @@ public:
                                   const ProviderPreset& p, const QString& apiKey,
                                   const QString& glossary = QString(),
                                   const QString& sourceLang = QString());
+
+    // 批量按行翻译：百度引擎一次请求带多行（标准版 1 次/秒，比逐行快一个数量级）；
+    // OpenAI 兼容引擎内部仍逐行。返回与输入等长，失败行为空串。
+    struct BatchResult {
+        QStringList lines;
+        int failed = 0;
+        QString error;
+    };
+    BatchResult translateBatch(const QStringList& lines, const QString& targetLang,
+                               const ProviderPreset& p, const QString& apiKey,
+                               const QString& glossary = QString(),
+                               const QString& sourceLang = QString(),
+                               const std::function<void(int done, int total)>& progress = {});
 
     TranslateResult testConnection(const ProviderPreset& p, const QString& apiKey);
 

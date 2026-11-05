@@ -36,6 +36,7 @@
 #include "vision.h"
 #include "baidu.h"
 #include "simpletex.h"
+#include "managed.h"
 #include "sessions.h"
 #include "translate.h"
 #include "secrets.h"
@@ -1118,33 +1119,18 @@ QImage Overlay::renderTranslated(const QImage& base, const QVector<OcrLine>& lin
     return out;
 }
 
-// 中文语言名 -> 百度语言码
-static QString toBaiduLang(const QString& name) {
-    const QString s = name.trimmed();
-    if (s.isEmpty() || s.contains(QStringLiteral("自动"))) return QStringLiteral("auto");
-    if (s.contains(QStringLiteral("英"))) return QStringLiteral("en");
-    if (s.contains(QStringLiteral("日"))) return QStringLiteral("jp");
-    if (s.contains(QStringLiteral("韩")) || s.contains(QStringLiteral("韓"))) return QStringLiteral("kor");
-    if (s.contains(QStringLiteral("繁"))) return QStringLiteral("cht");
-    if (s.contains(QStringLiteral("中"))) return QStringLiteral("zh");
-    if (s.contains(QStringLiteral("法"))) return QStringLiteral("fra");
-    if (s.contains(QStringLiteral("德"))) return QStringLiteral("de");
-    if (s.contains(QStringLiteral("俄"))) return QStringLiteral("ru");
-    if (s.contains(QStringLiteral("西"))) return QStringLiteral("spa");
-    if (s.contains(QStringLiteral("葡"))) return QStringLiteral("pt");
-    if (s.contains(QStringLiteral("意"))) return QStringLiteral("it");
-    return QStringLiteral("auto");
-}
+// 中文语言名 -> 百度语言码：见 baidu.cpp 的 baiduLangCode()
 
 void Overlay::onOcr() {
     QImage img = selectionImage(false);
     if (img.isNull()) return;
 
     Config& cfg = Config::get();
-    const bool baiduReady = !cfg.baiduAppId.trimmed().isEmpty() &&
-                            !secrets::load("baidu_secret").isEmpty();
+    const bool baiduReady = (!cfg.baiduAppId.trimmed().isEmpty() &&
+                             !secrets::load("baidu_secret").isEmpty())
+                            || managed::available();   // 内置云代理也算可用
     const QString stToken = secrets::load("simpletex_token");
-    const bool stReady = !stToken.isEmpty();
+    const bool stReady = !stToken.isEmpty() || managed::available();
     const bool visionReady = !secrets::load("vision_api_key_" + cfg.visionProvider).isEmpty();
 
     if (!baiduReady && !stReady && !visionReady) {
@@ -1178,24 +1164,15 @@ void Overlay::onOcr() {
     setCursor(Qt::WaitCursor);
     QCoreApplication::processEvents();
 
-    // ---- 公式：SimpleTex ----
+    // ---- 文字识别（轻量）：百度图片翻译，paste=0 不渲染贴合图（「译图」时按需再取）。
+    //      公式识别已改为结果窗口 LaTeX 页懒加载，不再拖慢识别主流程 ----
     QString latex;
-    if (cfg.ocrFormula && stReady) {
-        QElapsedTimer t; t.start();
-        SimpleTexClient st;
-        auto r = st.recognize(img, stToken, true);
-        elapsed += t.elapsed();
-        if (r.ok) latex = r.latex;
-        else if (err.isEmpty()) err = r.error;
-    }
-
-    // ---- 文字 + 翻译：百度图片翻译 ----
     if (baiduReady) {
         QElapsedTimer t; t.start();
-        BaiduPictureTranslate bd;
-        auto r = bd.translate(img, QStringLiteral("auto"), toBaiduLang(cfg.translateTarget),
-                              cfg.baiduAppId, secrets::load("baidu_secret"), cfg.baiduPaste);
-        elapsed += t.elapsed();
+        BaiduResult r = BaiduPictureTranslate().translate(
+            img, QStringLiteral("auto"), baiduLangCode(cfg.translateTarget),
+            cfg.baiduAppId, secrets::load("baidu_secret"), 0);
+        elapsed = t.elapsed();
         if (r.ok) {
             for (const auto& l : r.lines) {
                 OcrLine o;
@@ -1207,7 +1184,7 @@ void Overlay::onOcr() {
             }
             pasteImg = r.pasteImage;
             usedBackend = QStringLiteral("百度图片翻译");
-        } else if (err.isEmpty()) {
+        } else {
             err = r.error;
         }
     }
@@ -1241,8 +1218,11 @@ void Overlay::onOcr() {
     unsetCursor();
 
     if (lines.isEmpty() && latex.isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("识别"),
-                             err.isEmpty() ? QStringLiteral("没有识别到内容") : err);
+        QString msg = err.isEmpty() ? QStringLiteral("没有识别到内容") : err;
+        if (msg.contains(QStringLiteral("52003")))
+            msg += QStringLiteral("\n\n请在百度翻译开放平台控制台开通「图片翻译」服务"
+                                  "（与「通用文本翻译」是两个开关，各自有免费额度）。");
+        QMessageBox::warning(this, QStringLiteral("识别"), msg);
         return;
     }
 
@@ -1267,7 +1247,8 @@ void Overlay::onOcr() {
                 if (!secrets::load("translate_api_key_" + p.id).isEmpty()) { anyKey = true; break; }
             }
         }
-        dlg.setOnlineAvailable(anyKey);
+        // 配置了百度（识别页凭据）也视为在线可用：翻译/译图走百度通用文本翻译
+        dlg.setOnlineAvailable(anyKey || baiduReady);
     }
 
     if (!translated.isEmpty() && translated.size() == lines.size()) dlg.setTranslated(translated);
@@ -1285,6 +1266,14 @@ void Overlay::onOcr() {
         if (!c.translateFallbackProvider.isEmpty() && c.translateFallbackProvider != c.translateProvider)
             ids << c.translateFallbackProvider;
         for (const QString& id : ids) {
+            // 百度：凭据取「识别」页的 APPID/密钥，key 放密钥；
+            // 无用户凭据但有内置云代理时也入链（BaiduTextTranslate 内部走托管模式）
+            if (id == QStringLiteral("baidu")) {
+                const QString sec = secrets::load("baidu_secret");
+                if ((!c.baiduAppId.trimmed().isEmpty() && !sec.isEmpty()) || managed::available())
+                    chain.append({TranslateClient::presetById(id), sec});
+                continue;
+            }
             ProviderPreset p = TranslateClient::presetById(id);
             if (id == c.translateProvider) {
                 if (!c.translateBaseUrl.isEmpty()) p.baseUrl = c.translateBaseUrl;
@@ -1306,33 +1295,48 @@ void Overlay::onOcr() {
         if (rows.isEmpty()) return;
         const auto chain = buildChain();
         if (chain.isEmpty()) {
-            dlg.setStatusText(QStringLiteral("未配置翻译 API Key（设置 → 翻译）"));
+            dlg.setStatusText(QStringLiteral("未配置翻译服务（设置 → 翻译选百度，或填 API Key）"));
             return;
         }
         const QString src = dlg.sourceLang();
         const QString tgt = dlg.targetLang();
         const QString glossary = Config::get().translateGlossary;
-        dlg.setBusy(true, QStringLiteral("翻译中… 0/%1").arg(rows.size()));
+        dlg.setBusy(true, QStringLiteral("翻译中…"));
         QApplication::processEvents();
 
+        // 批量：主引擎一次带全部行（百度多行合一）；失败行再用备用引擎补
         QStringList out;
         int fail = 0;
-        for (int i = 0; i < rows.size(); ++i) {
-            const QString text = rows[i].trimmed();
-            if (text.isEmpty()) { out << QString(); continue; }
-            TranslateResult r;
-            for (const auto& pr : chain) {
-                r = TranslateClient().translateLine(text, tgt, pr.first, pr.second, glossary, src);
-                if (r.ok) break;
+        QString firstError;
+        for (int e = 0; e < chain.size(); ++e) {
+            auto r = TranslateClient().translateBatch(rows, tgt, chain[e].first, chain[e].second,
+                                                      glossary, src,
+                                                      [&dlg](int done, int total) {
+                dlg.setBusy(true, QStringLiteral("翻译中… %1/%2").arg(done).arg(total));
+                QApplication::processEvents();
+            });
+            if (e == 0) {
+                out = r.lines;
+                fail = r.failed;
+                firstError = r.error;
+            } else {
+                for (int i = 0; i < out.size(); ++i) {
+                    if (out[i].isEmpty() && i < r.lines.size() && !r.lines[i].isEmpty()) {
+                        out[i] = r.lines[i];
+                        --fail;
+                    }
+                }
             }
-            if (r.ok) out << r.text;
-            else { out << QStringLiteral("[翻译失败]"); ++fail; }
-            dlg.setBusy(true, QStringLiteral("翻译中… %1/%2").arg(i + 1).arg(rows.size()));
-            QApplication::processEvents();
+            if (fail == 0) break;
         }
+        for (QString& s : out)
+            if (s.isEmpty()) s = QStringLiteral("[翻译失败]");
         dlg.setTranslated(out);
-        dlg.setBusy(false, fail == 0 ? QStringLiteral("翻译完成")
-                                     : QStringLiteral("完成，%1 行失败").arg(fail));
+        dlg.setBusy(false, fail == 0
+            ? QStringLiteral("翻译完成")
+            : QStringLiteral("完成，%1 行失败%2").arg(fail)
+                .arg(firstError.isEmpty() ? QString()
+                                          : QStringLiteral("（%1）").arg(firstError.left(60))));
     });
 
     QObject::connect(&dlg, &OcrDialog::copyRequested, &dlg, [&dlg](const QString& text) {
@@ -1340,24 +1344,51 @@ void Overlay::onOcr() {
         dlg.setStatusText(QStringLiteral("已复制到剪贴板"));
     });
 
-    // 译图：优先用百度返回的整图贴合结果；否则按坐标本地回填
+    // 公式识别懒加载：首次切到 LaTeX 页才调 SimpleTex（识别主流程不等它）
+    QObject::connect(&dlg, &OcrDialog::latexRequested, &dlg,
+                     [&dlg, img, stToken, &cfg]() {
+        if (!cfg.ocrFormula) {
+            dlg.setLatex(QStringLiteral("（已在设置中关闭公式识别）"));
+            return;
+        }
+        dlg.setBusy(true, QStringLiteral("公式识别中…"));
+        QApplication::processEvents();
+        QElapsedTimer t; t.start();
+        const SimpleTexResult r = SimpleTexClient().recognize(img, stToken, true);
+        dlg.setBusy(false, QString());
+        if (r.ok) dlg.setLatex(r.latex);
+        else dlg.setLatex(QStringLiteral("【公式识别失败：%1】").arg(r.error));
+        dlg.setStatusText(QStringLiteral("公式识别 %1 ms").arg(t.elapsed()));
+    });
+
+    // 译图：独立调用百度（带贴合渲染，用设置里的贴合方式）；失败再按坐标本地回填
     QImage pinImg;
     bool pinPending = false;
     QObject::connect(&dlg, &OcrDialog::imageTranslateRequested, &dlg,
-                     [&dlg, &pinImg, &pinPending, pasteImg, img, lines, buildChain]() {
-        if (!pasteImg.isNull()) {
-            pinImg = pasteImg;
-            pinPending = true;
-            dlg.accept();
-            return;
+                     [&dlg, &pinImg, &pinPending, img, lines, buildChain, &cfg, baiduReady]() {
+        if (baiduReady) {
+            dlg.setBusy(true, QStringLiteral("译图中…（贴合渲染）"));
+            QApplication::processEvents();
+            BaiduResult r = BaiduPictureTranslate().translate(
+                img, QStringLiteral("auto"), baiduLangCode(dlg.targetLang()),
+                cfg.baiduAppId, secrets::load("baidu_secret"), cfg.baiduPaste);
+            dlg.setBusy(false, QString());
+            if (r.ok && !r.pasteImage.isNull()) {
+                pinImg = r.pasteImage;
+                pinPending = true;
+                dlg.accept();
+                return;
+            }
+            if (!r.ok)
+                dlg.setStatusText(QStringLiteral("贴合失败（%1），改用本地回填").arg(r.error.left(60)));
         }
         if (lines.isEmpty() || lines.first().box.isNull()) {
-            dlg.setStatusText(QStringLiteral("当前结果没有坐标，无法回填；可改用百度图片翻译"));
+            dlg.setStatusText(QStringLiteral("当前结果没有坐标，无法回填"));
             return;
         }
         const auto chain = buildChain();
         if (chain.isEmpty()) {
-            dlg.setStatusText(QStringLiteral("未配置翻译 API Key（设置 → 翻译）"));
+            dlg.setStatusText(QStringLiteral("未配置翻译服务（设置 → 翻译选百度，或填 API Key）"));
             return;
         }
         const QString src = dlg.sourceLang();
@@ -1366,19 +1397,25 @@ void Overlay::onOcr() {
         dlg.setBusy(true, QStringLiteral("译图中…"));
         QApplication::processEvents();
 
+        // 批量：主引擎一次带全部行；失败行用备用引擎补
+        QStringList texts;
+        texts.reserve(lines.size());
+        for (const OcrLine& l : lines) texts << l.text;
         QStringList translated;
-        int okCount = 0;
-        for (int i = 0; i < lines.size(); ++i) {
-            TranslateResult r;
-            for (const auto& pr : chain) {
-                r = TranslateClient().translateLine(lines[i].text, tgt, pr.first, pr.second, glossary, src);
-                if (r.ok) break;
-            }
-            translated << (r.ok ? r.text : QString());
-            if (r.ok) ++okCount;
-            dlg.setBusy(true, QStringLiteral("译图中… %1/%2").arg(i + 1).arg(lines.size()));
-            QApplication::processEvents();
+        for (int e = 0; e < chain.size(); ++e) {
+            auto r = TranslateClient().translateBatch(texts, tgt, chain[e].first, chain[e].second,
+                                                      glossary, src,
+                                                      [&dlg](int done, int total) {
+                dlg.setBusy(true, QStringLiteral("译图中… %1/%2").arg(done).arg(total));
+                QApplication::processEvents();
+            });
+            if (e == 0) translated = r.lines;
+            else for (int i = 0; i < translated.size(); ++i)
+                if (translated[i].isEmpty() && i < r.lines.size())
+                    translated[i] = r.lines[i];
         }
+        int okCount = 0;
+        for (const QString& s : translated) if (!s.isEmpty()) ++okCount;
         dlg.setBusy(false, QStringLiteral("译图完成"));
         if (okCount == 0) return;
         pinImg = renderTranslated(img, lines, translated);
