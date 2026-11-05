@@ -34,4 +34,13 @@ QRect trimBlackBorder(QImage& img, QRect rectIn);
 // 窗口所在显示器在物理像素下的矩形
 QRect nativeMonitorRect(quintptr hwnd);
 
+// —— 黑屏兼容修复（1.9.2），自检/诊断可直调 ——
+// duplication 纹理行 -> ARGB32。支持 B8G8R8A8 / R16G16B16A16_FLOAT(HDR) /
+// R10G10B10A2(10bit 面板)；其余格式返回 false（调用方走 GDI 兜底）。
+// dxgiFormat 传 DXGI_FORMAT_* 整数值（避免头文件依赖 windows.h）
+bool convertDuplicationRow(QImage& img, int y, const uchar* src, unsigned width,
+                           unsigned rowPitch, int dxgiFormat);
+// 近全黑检测（黑帧防护）
+bool isAlmostBlack(const QImage& img);
+
 } // namespace capture

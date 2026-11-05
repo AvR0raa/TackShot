@@ -6,6 +6,7 @@
 #include <QVector>
 #include <QPainter>
 #include <cstring>
+#include <cmath>
 
 #include <windows.h>
 #include <d3d11.h>
@@ -17,6 +18,88 @@ struct Surface {
     QRect rect;     // 物理像素，虚拟桌面坐标
     QImage image;
 };
+
+// half float (f16) -> float，无依赖手写解码
+inline float halfToFloat(quint16 h) {
+    const quint32 sign = (h >> 15) & 1;
+    const quint32 exp = (h >> 10) & 0x1F;
+    const quint32 man = h & 0x3FF;
+    float v;
+    if (exp == 0) {
+        v = std::ldexp(float(man), -24);           // 次正规
+    } else if (exp == 31) {
+        v = man ? NAN : INFINITY;
+    } else {
+        v = std::ldexp(float((man | 0x400)), int(exp) - 25);
+    }
+    return sign ? -v : v;
+}
+
+// 线性 scRGB [0..1+] -> sRGB 8bit（简单 tone map：超亮部 clamp）
+inline quint8 scToSrgb8(float lin) {
+    if (!(lin > 0.0f)) return 0;
+    if (lin > 1.0f) lin = 1.0f;
+    const float s = lin <= 0.0031308f ? lin * 12.92f
+                                        : 1.055f * std::pow(lin, 1.0f / 2.4f) - 0.055f;
+    return quint8(s * 255.0f + 0.5f);
+}
+
+} // namespace
+
+namespace capture {
+
+static QString g_lastPath = QStringLiteral("none");
+
+// duplication 纹理行 -> ARGB32 行。返回 false 表示不支持的格式（走 GDI 兜底）。
+// （导出到 capture:: 供 --capture-selftest 验证 HDR/10bit 转换）
+bool convertDuplicationRow(QImage& img, int y, const uchar* src, unsigned width,
+                           unsigned rowPitch, int dxgiFormat) {
+    const DXGI_FORMAT fmt = DXGI_FORMAT(dxgiFormat);
+    switch (fmt) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        std::memcpy(img.scanLine(y), src + size_t(y) * rowPitch, size_t(width) * 4);
+        return true;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: {   // HDR / 高级色彩：8 字节/像素 half float
+        const quint16* s = reinterpret_cast<const quint16*>(src + size_t(y) * rowPitch);
+        QRgb* d = reinterpret_cast<QRgb*>(img.scanLine(y));
+        for (UINT x = 0; x < width; ++x) {
+            const float r = halfToFloat(s[x * 4 + 0]);
+            const float g = halfToFloat(s[x * 4 + 1]);
+            const float b = halfToFloat(s[x * 4 + 2]);
+            d[x] = qRgb(scToSrgb8(r), scToSrgb8(g), scToSrgb8(b));
+        }
+        return true;
+    }
+    case DXGI_FORMAT_R10G10B10A2_UNORM: {    // 10bit 面板
+        const quint32* s = reinterpret_cast<const quint32*>(src + size_t(y) * rowPitch);
+        QRgb* d = reinterpret_cast<QRgb*>(img.scanLine(y));
+        for (UINT x = 0; x < width; ++x) {
+            const quint32 v = s[x];
+            d[x] = qRgb(quint8(((v >> 0) & 0x3FF) >> 2),
+                        quint8(((v >> 10) & 0x3FF) >> 2),
+                        quint8(((v >> 20) & 0x3FF) >> 2));
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// 近全黑检测（抽样）：>99.5% 像素 qGray<8 视为黑帧
+bool isAlmostBlack(const QImage& img) {
+    if (img.isNull()) return true;
+    long long dark = 0, total = 0;
+    for (int y = 0; y < img.height(); y += 7) {
+        const QRgb* line = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+        for (int x = 0; x < img.width(); x += 7) {
+            if (qGray(line[x]) < 8) ++dark;
+            ++total;
+        }
+    }
+    return total > 0 && dark * 1000 >= total * 995;
+}
 
 QImage compose(const QVector<Surface>& surfaces, QRect& virtualRect) {
     if (surfaces.isEmpty()) return QImage();
@@ -57,6 +140,7 @@ bool grabOutputDesktop(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIOutput*
     if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex) {
         D3D11_TEXTURE2D_DESC desc{};
         tex->GetDesc(&desc);
+        const DXGI_FORMAT srcFmt = desc.Format;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         desc.BindFlags = 0;
@@ -69,9 +153,11 @@ bool grabOutputDesktop(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIOutput*
             D3D11_MAPPED_SUBRESOURCE map{};
             if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
                 QImage img(int(desc.Width), int(desc.Height), QImage::Format_ARGB32);
-                const BYTE* src = static_cast<const BYTE*>(map.pData);
-                for (UINT y = 0; y < desc.Height; ++y)
-                    std::memcpy(img.scanLine(int(y)), src + size_t(y) * map.RowPitch, size_t(desc.Width) * 4);
+                const uchar* src = static_cast<const uchar*>(map.pData);
+                bool conv = true;
+                for (UINT y = 0; y < desc.Height && conv; ++y)
+                    conv = convertDuplicationRow(img, int(y), src, desc.Width,
+                                                  map.RowPitch, int(srcFmt));
                 ctx->Unmap(staging, 0);
 
                 DXGI_OUTPUT_DESC od{};
@@ -80,7 +166,7 @@ bool grabOutputDesktop(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIOutput*
                                     od.DesktopCoordinates.right - od.DesktopCoordinates.left,
                                     od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
                 result.image = img;
-                ok = true;
+                ok = conv;
             }
             staging->Release();
         }
@@ -89,15 +175,16 @@ bool grabOutputDesktop(ID3D11Device* dev, ID3D11DeviceContext* ctx, IDXGIOutput*
     dup->ReleaseFrame();
     res->Release();
     dup->Release();
+
+    // 黑帧防护：部分驱动/双显卡首帧为黑，或格式不支持得到坏图时，
+    // 用 GDI 交叉验证——GDI 有内容而 duplication 全黑则采用 GDI（真黑桌面 GDI 也黑，不误伤）
+    if (ok && isAlmostBlack(result.image)) {
+        QImage gdi = capture::captureRect(result.rect);
+        if (!gdi.isNull() && gdi.size() == result.image.size() && !isAlmostBlack(gdi))
+            result.image = gdi;
+    }
     return ok;
 }
-
-} // namespace
-
-namespace capture {
-
-static QString g_lastPath = QStringLiteral("none");
-
 
 bool dxgiAvailable() {
     ID3D11Device* dev = nullptr;
@@ -152,6 +239,8 @@ QImage captureRect(const QRect& r) {
     if (bmp && bits) {
         HGDIOBJ old = SelectObject(mem, bmp);
         BOOL ok = BitBlt(mem, 0, 0, r.width(), r.height(), screen, r.x(), r.y(), SRCCOPY | CAPTUREBLT);
+        if (!ok)   // 部分驱动/远程会话不支持 CAPTUREBLT（叠加层采集），去掉重试
+            ok = BitBlt(mem, 0, 0, r.width(), r.height(), screen, r.x(), r.y(), SRCCOPY);
         SelectObject(mem, old);
         if (ok) {
             QImage tmp(static_cast<uchar*>(bits), r.width(), r.height(), r.width() * 4,
@@ -188,7 +277,22 @@ QImage captureVirtualDesktop(QRect* physicalRectOut, QString* error) {
                     if (ad->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND) break;
                     if (!out) break;
                     Surface s;
-                    if (grabOutputDesktop(dev, ctx, out, s))
+                    if (!grabOutputDesktop(dev, ctx, out, s)) {
+                        // 双显卡（Optimus 等）：默认设备与该输出不在同一适配器时
+                        // DuplicateOutput 返回 UNSUPPORTED -> 用输出所在适配器重建设备重试
+                        ID3D11Device* dev2 = nullptr;
+                        ID3D11DeviceContext* ctx2 = nullptr;
+                        D3D_FEATURE_LEVEL fl2;
+                        if (SUCCEEDED(D3D11CreateDevice(ad, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                                        nullptr, 0, D3D11_SDK_VERSION,
+                                                        &dev2, &fl2, &ctx2)) && dev2 && ctx2) {
+                            grabOutputDesktop(dev2, ctx2, out, s);
+                            ctx2->Release();
+                            dev2->Release();
+                        }
+                    }
+                    if (!s.image.isNull())
                         surfaces.push_back(s);
                     out->Release();
                 }

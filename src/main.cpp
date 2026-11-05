@@ -611,6 +611,103 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // 长截图真实场景回归：固定顶栏 / 回滚 / 快滚断档（1.9.1 修复的三个场景）
+    int ls3 = args.indexOf("--longshot3-selftest");
+    if (ls3 >= 0) {
+        QString out = (ls3 + 1 < args.size()) ? args[ls3 + 1] : "ls3.txt";
+        const int W = 800, VH = 800, STICKY = 200;
+        // 合成页面：非周期纹理（低频周期>页面高，避免 y 与 y+800 相似），顶部 STICKY 行固定
+        auto pageRow = [](int y) -> int {
+            if (y < STICKY) return 60 + (y * 7 % 40);
+            double v = 120 + 100 * std::sin(y * 0.009)            // 周期 ~698px，与 800 偏移不相似
+                       + 30 * std::sin(y * 0.203 + 1.7);
+            return qBound(0, int(v), 255);
+        };
+        auto frameAt = [&](int top) {
+            QImage f(W, VH, QImage::Format_RGB32);
+            for (int y = 0; y < VH; ++y) {
+                const int py = (y < STICKY) ? y : (y - STICKY) + top + STICKY;
+                const int g = pageRow(py);
+                for (int x = 0; x < W; x += 4) {
+                    const int xx = qBound(0, g + ((x / 32) % 2 ? 12 : -12) + (x % 17) / 4, 255);
+                    f.setPixel(x, y, qRgb(xx, xx, xx));
+                    for (int k = 1; k < 4 && x + k < W; ++k) f.setPixel(x + k, y, qRgb(xx, xx, xx));
+                }
+            }
+            return f;
+        };
+        // 复刻 LongShotBar::tick 的拼接决策（去掉 UI），验证行为而非只测底层函数
+        auto simTicks = [&](QImage canvas, std::initializer_list<int> tops) {
+            int misses = 0, gaps = 0, joined = 0;
+            QImage prev;
+            for (int top : tops) {
+                QImage frame = frameAt(top);
+                if (canvas.isNull()) { canvas = frame; prev = frame; continue; }
+                if (frame.size() == prev.size()) {
+                    long long diff = 0;
+                    for (int y = 0; y < frame.height(); y += 8) {
+                        const QRgb* a = reinterpret_cast<const QRgb*>(frame.constScanLine(y));
+                        const QRgb* b = reinterpret_cast<const QRgb*>(prev.constScanLine(y));
+                        for (int x = 0; x < frame.width(); x += 8)
+                            diff += std::abs(qGray(a[x]) - qGray(b[x]));
+                    }
+                    if (diff < 2000) { prev = frame; continue; }
+                }
+                bool matched = false;
+                QImage next = longshot::appendFrame(canvas, frame, &matched);
+                if (matched) { canvas = next; ++joined; misses = 0; }
+                else if (++misses >= 5) {
+                    QImage out(canvas.width(), canvas.height() + frame.height(), canvas.format());
+                    QPainter p(&out);
+                    p.drawImage(0, 0, canvas);
+                    p.drawImage(0, canvas.height(), frame);
+                    p.end();
+                    canvas = out; ++gaps; misses = 0;
+                }
+                prev = frame;
+            }
+            return QString("canvas=%1x%2 joined=%3 gaps=%4")
+                       .arg(canvas.width()).arg(canvas.height()).arg(joined).arg(gaps);
+        };
+
+        QStringList log;
+        bool allPass = true;
+
+        // 1) 固定顶栏 + 匀速下滚 3 次（旧版 gate 会把每帧都丢掉）
+        const QString r1 = simTicks(QImage(), {0, 90, 180, 270});
+        const bool p1 = r1.contains("canvas=800x1070") && r1.contains("joined=3")
+                        && r1.contains("gaps=0");
+        log << QString("sticky+scroll3x90: %1 pass=%2").arg(r1, p1 ? "1" : "0");
+        allPass &= p1;
+
+        // 2) 回滚帧不产生重复拼接（下滚 90 -> 回滚 90 -> 再下滚 180）
+        const QString r2 = simTicks(QImage(), {0, 90, 0, 180});
+        const bool p2 = r2.contains("canvas=800x980") && r2.contains("joined=2")
+                        && r2.contains("gaps=0");
+        log << QString("rollback-midway: %1 pass=%2").arg(r2, p2 ? "1" : "0");
+        allPass &= p2;
+
+        // 3) 整屏快滚：底层应拒绝匹配（无重叠），tick 层连续 5 帧接不上且画面在变 -> 断档续接
+        bool m3 = false;
+        longshot::appendFrame(frameAt(0), frameAt(800), &m3);
+        const QString r3 = simTicks(QImage(), {0, 800, 900, 1000, 1100, 1200});
+        const bool p3 = !m3 && r3.contains("gaps=1") && r3.contains("joined=0");
+        log << QString("fastscroll-screen: appendMatched=%1 sim: %2 pass=%3")
+                   .arg(m3 ? 1 : 0).arg(r3, p3 ? "1" : "0");
+        allPass &= p3;
+
+        log << QString("ALL_PASS=%1").arg(allPass ? "true" : "false");
+        QFile lf(out);
+        if (lf.open(QIODevice::WriteOnly)) {
+            QTextStream ts(&lf);
+            ts.setEncoding(QStringConverter::Utf8);
+            for (const QString& l : log) ts << l << "\n";
+            lf.close();
+        }
+        QTextStream(stdout) << log.join(QLatin1Char('\n')) << "\n";
+        return allPass ? 0 : 31;
+    }
+
     // 长截图（竖向 + 回滚忽略）自检
     int ls2 = args.indexOf("--longshot2-selftest");
     if (ls2 >= 0) {
@@ -694,6 +791,102 @@ int main(int argc, char** argv) {
             f.close();
         }
         return pass ? 0 : 23;
+    }
+
+    // 抓屏黑屏兼容自检：HDR float / 10bit 格式转换 + 黑帧检测（1.9.2）
+    int capIdx = args.indexOf("--capture-selftest");
+    if (capIdx >= 0) {
+        QString out = (capIdx + 1 < args.size()) ? args[capIdx + 1] : "capture_selftest.txt";
+        QStringList log;
+        bool allPass = true;
+
+        // 1) R16G16B16A16_FLOAT（HDR）：已知 scRGB 值 -> 转换后应接近期望 sRGB
+        {
+            const int W = 64;
+            const float lin[4] = {0.0f, 0.2f, 0.5f, 1.0f};   // 线性值
+            QImage img(W, 1, QImage::Format_ARGB32);
+            QVector<quint16> halfRow(W * 4, 0);
+            auto toHalf = [](float v) -> quint16 {          // float->half（仅覆盖常规范围，自检够用）
+                if (v == 0.0f) return 0;
+                const quint32 sign = v < 0 ? 1 : 0;
+                v = std::abs(v);
+                int e;
+                const float m = std::frexp(v, &e);           // m in [0.5,1), v = m*2^e
+                const quint32 man = quint32((m - 0.5f) * 2048.0f + 0.5f) & 0x3FF;
+                const int exp16 = e + 14;                    // bias 15，[0.5,1)->1.x
+                return quint16((sign << 15) | (exp16 << 10) | man);
+            };
+            for (int x = 0; x < W; ++x) {
+                const float lv = lin[x * 4 / W];
+                halfRow[x * 4 + 0] = toHalf(lv);
+                halfRow[x * 4 + 1] = toHalf(lv * 0.5f);
+                halfRow[x * 4 + 2] = toHalf(lv * 0.25f);
+                halfRow[x * 4 + 3] = toHalf(1.0f);
+            }
+            const bool ok = capture::convertDuplicationRow(
+                img, 0, reinterpret_cast<const uchar*>(halfRow.constData()), W,
+                W * 8, 10 /* DXGI_FORMAT_R16G16B16A16_FLOAT */);
+            // 校验：x=0 全黑；末尾 R=1.0 -> 255（G=128 左右、B=64 左右的递减）
+            const QRgb black = img.pixel(0, 0);
+            const QRgb white = img.pixel(W - 1, 0);
+            const bool pass = ok && qRed(black) < 4 && qGreen(black) < 2
+                              && qRed(white) >= 250 && qRed(white) < 256
+                              && qGreen(white) > 100 && qGreen(white) < 220
+                              && qBlue(white) > 40 && qBlue(white) < 150;
+            log << QString("hdr-f16: ok=%1 black=(%2,%3,%4) white=(%5,%6,%7) pass=%8")
+                       .arg(ok).arg(qRed(black)).arg(qGreen(black)).arg(qBlue(black))
+                       .arg(qRed(white)).arg(qGreen(white)).arg(qBlue(white))
+                       .arg(pass ? 1 : 0);
+            allPass &= pass;
+        }
+
+        // 2) R10G10B10A2（10bit 面板）：10bit 1023 -> 8bit 255
+        {
+            const int W = 4;
+            QImage img(W, 1, QImage::Format_ARGB32);
+            quint32 row[W];
+            const quint32 rgb10[4] = {0, 256, 512, 1023};
+            for (int x = 0; x < W; ++x)
+                row[x] = (rgb10[x]) | (rgb10[x] << 10) | (rgb10[x] << 20);
+            const bool ok = capture::convertDuplicationRow(
+                img, 0, reinterpret_cast<const uchar*>(row), W, W * 4,
+                24 /* DXGI_FORMAT_R10G10B10A2_UNORM */);
+            const bool pass = ok
+                              && qRed(img.pixel(0, 0)) == 0
+                              && qRed(img.pixel(1, 0)) == 64
+                              && qRed(img.pixel(2, 0)) == 128
+                              && qRed(img.pixel(3, 0)) == 255;
+            log << QString("r10g10b10: ok=%1 px=%2,%3,%4,%5 pass=%6")
+                       .arg(ok).arg(qRed(img.pixel(0, 0))).arg(qRed(img.pixel(1, 0)))
+                       .arg(qRed(img.pixel(2, 0))).arg(qRed(img.pixel(3, 0)))
+                       .arg(pass ? 1 : 0);
+            allPass &= pass;
+        }
+
+        // 3) 黑帧检测
+        {
+            QImage blackImg(256, 256, QImage::Format_ARGB32);
+            blackImg.fill(Qt::black);
+            QImage normal(256, 256, QImage::Format_ARGB32);
+            normal.fill(QColor(40, 40, 40));   // 深灰也算有内容
+            const bool pass = capture::isAlmostBlack(blackImg)
+                              && !capture::isAlmostBlack(normal);
+            log << QString("blackDetect: black=%1 normal=%2 pass=%3")
+                       .arg(capture::isAlmostBlack(blackImg))
+                       .arg(capture::isAlmostBlack(normal)).arg(pass ? 1 : 0);
+            allPass &= pass;
+        }
+
+        log << QString("ALL_PASS=%1").arg(allPass ? "true" : "false");
+        QFile cf(out);
+        if (cf.open(QIODevice::WriteOnly)) {
+            QTextStream ts(&cf);
+            ts.setEncoding(QStringConverter::Utf8);
+            for (const QString& l : log) ts << l << "\n";
+            cf.close();
+        }
+        QTextStream(stdout) << log.join(QLatin1Char('\n')) << "\n";
+        return allPass ? 0 : 32;
     }
 
     // 纯抓屏诊断：抓一张桌面存盘，并报告路径/DPI 状态/黑边情况

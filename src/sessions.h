@@ -20,7 +20,7 @@ public:
     explicit LongShotBar(const QRect& physRegion, QWidget* parent = nullptr);
 
 signals:
-    void finished(QImage result);
+    void finished(QImage result, int gaps);
     void cancelled();
 
 private:
@@ -35,6 +35,8 @@ private:
     QLabel* m_preview = nullptr;
     int m_frames = 0;
     int m_rolledBack = 0;
+    int m_miss = 0;      // 连续未拼接上的帧数（快滚断档检测）
+    int m_gaps = 0;      // 断档续接次数
     int m_dir = 0;
 };
 

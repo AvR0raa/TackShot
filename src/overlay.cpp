@@ -1442,7 +1442,7 @@ void Overlay::onLongShot() {
     QRect region = physRegionOf(m_physRect, m_sel);
     hide();
     auto* bar = new LongShotBar(region);
-    connect(bar, &LongShotBar::finished, this, [this](const QImage& img) {
+    connect(bar, &LongShotBar::finished, this, [this](const QImage& img, int gaps) {
         if (img.isNull()) return;
         QString dir = Config::get().saveDir;
         QDir().mkpath(dir);
@@ -1450,9 +1450,12 @@ void Overlay::onLongShot() {
             QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss"));
         img.save(path);
         QApplication::clipboard()->setImage(img);
+        QString warn = gaps > 0
+            ? QStringLiteral("\n\n⚠ 有 %1 处断档（滚动过快导致部分内容未捕获，建议放慢滚动）。").arg(gaps)
+            : QString();
         QMessageBox::information(nullptr, QStringLiteral("长截图"),
-            QStringLiteral("已保存并复制到剪贴板：\n%1\n尺寸：%2 × %3")
-                .arg(QDir::toNativeSeparators(path)).arg(img.width()).arg(img.height()));
+            QStringLiteral("已保存并复制到剪贴板：\n%1\n尺寸：%2 × %3%4")
+                .arg(QDir::toNativeSeparators(path)).arg(img.width()).arg(img.height()).arg(warn));
         close();
         emit closed();
     });

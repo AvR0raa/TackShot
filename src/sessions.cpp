@@ -104,20 +104,33 @@ void LongShotBar::tick() {
             }
             if (diff < 2000) return;   // 没变化
         }
-        // 长截图固定竖向拼接；先判断滚动方向，回滚（向上滚）的帧直接丢弃，
-        // 否则会把已经拍过的内容再拼一遍。
-        const int dy = longshot::verticalShift(m_prev, frame);
-        bool skip = false;
-        if (dy != INT_MIN && dy <= 1) {
-            skip = true;                      // 回滚或没滚动
-            m_rolledBack += (dy != INT_MIN && dy < -1) ? 1 : 0;
-        }
-        if (!skip) {
-            bool matched = false;
-            QImage next = longshot::appendFrame(m_canvas, frame, &matched);
-            if (matched) {
-                m_canvas = next;
-                m_dir = 0;                    // 竖向
+        // 直接交给拼接器判断：没滚动/回滚/翻页 -> 帧里找不到画布底部内容 -> matched=false 自然丢弃。
+        // （1.9.1 前这里先用 verticalShift 顶部模板预判方向，固定顶栏会让每帧都被误判为
+        //   “没滚动/回滚”而丢弃——长截图一帧都拼不上；appendFrame 用底部模板不受顶栏影响，
+        //   回滚帧同样匹配不上，预判是多余且有害的，已移除。）
+        bool matched = false;
+        QImage next = longshot::appendFrame(m_canvas, frame, &matched);
+        if (matched) {
+            m_canvas = next;
+            m_dir = 0;                    // 竖向
+            m_frames++;
+            m_miss = 0;
+        } else {
+            ++m_miss;
+            // 回滚仅作统计展示（verticalShift 顶部模板对固定顶栏不准，不影响拼接行为）
+            const int dy = longshot::verticalShift(m_prev, frame);
+            if (dy != INT_MIN && dy < -1) ++m_rolledBack;
+            // 断档续接：连续 5 帧（约 1.5s）接不上且画面在变 -> 内容已超出可匹配范围
+            // （一次滚过一整屏等），强制把当前帧接为新起点，避免此后永远停摆
+            if (m_miss >= 5) {
+                QImage out(m_canvas.width(), m_canvas.height() + frame.height(), m_canvas.format());
+                QPainter p(&out);
+                p.drawImage(0, 0, m_canvas);
+                p.drawImage(0, m_canvas.height(), frame);
+                p.end();
+                m_canvas = out;
+                ++m_gaps;
+                m_miss = 0;
                 m_frames++;
             }
         }
@@ -127,6 +140,8 @@ void LongShotBar::tick() {
                        .arg(m_frames + 1).arg(m_canvas.width()).arg(m_canvas.height());
     if (m_rolledBack > 0)
         info += QStringLiteral(" · 已忽略 %1 次回滚").arg(m_rolledBack);
+    if (m_gaps > 0)
+        info += QStringLiteral(" · ⚠ 含 %1 处断档（滚动过快）").arg(m_gaps);
     m_info->setText(info);
     QImage thumb = m_canvas.scaledToHeight(28, Qt::SmoothTransformation);
     if (thumb.width() > 296) thumb = thumb.copy(thumb.width() - 296, 0, 296, thumb.height());
@@ -135,7 +150,7 @@ void LongShotBar::tick() {
 
 void LongShotBar::doFinish() {
     m_timer->stop();
-    emit finished(m_canvas);
+    emit finished(m_canvas, m_gaps);
     close();
 }
 

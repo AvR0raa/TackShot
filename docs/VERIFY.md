@@ -488,3 +488,61 @@ worker.js readImageBytes）解码后构造 multipart 转发百度。text 路由�
 ### 回归
 --proxy-selftest 5/5、--cloud-selftest、--baidu-text-selftest、--translate-selftest、
 --ocr-dialog-preview 全部通过
+
+## 33. 1.9.1：长截图三项修复（--longshot3-selftest 真实场景回归）
+
+### Bug 1（主因）：防回滚闸门被固定顶栏劫持 -> 一帧都拼不上
+- 根因：tick() 先用 verticalShift 的「prev 顶部模板」预判滚动方向；选区含 sticky
+  顶栏时顶部恒定 -> 每帧判为「没滚动/回滚」丢弃。实测（--longshot3-selftest 复现）：
+  真实下滚 90px，dy 判为 -12 -> SKIP
+- 修复：移除闸门，直接交 appendFrame 裁决（没滚动/回滚帧里找不到画布底部内容，
+  matched=false 天然丢弃；verticalShift 保留仅作统计显示）
+
+### Bug 2：sticky 页面拼接几何错误 -> 原分辨率复核 + 固定栏感知
+- 发现过程：加逐像素复核后 sticky 场景全部被拒（diff 15~25）——揭示 sticky 帧
+  不是纯平移（固定区 y↔y、滚动区 y+shift），缩放域 meanSad=0 是巧合、中间错位 90 行
+- 修复：appendFrame 检测画布/帧顶部逐行相同的静态前缀（>=40 行），从帧中剔除后按
+  纯平移拼接（固定栏首帧已含，不重复不错位）；再做原分辨率 ±8 行微调对齐
+  （修正缩放坐标 1/scale≈3px 量化误差，顺带把拼接精度提到像素级，diff=0.00）
+  + 全样本复核（>6 拒绝，挡住错配重影）
+
+### Bug 3：快滚断档后永久停摆
+- 修复：连续 5 帧（约 1.5s）接不上且画面在变 -> 断档续接（当前帧强制接为新起点），
+  状态条与完成弹窗提示「⚠ 含 N 处断档」；finished 信号增加 gaps 参数
+
+### 其他加固
+- 匹配阈值 8.0 -> 5.0；次优候选歧义检查（second < best*1.15 且非全同时拒绝，防重复纹理错位）
+- TACKSHOT_LS_DEBUG=1 输出匹配决策诊断（bestY/meanSad/refine/refuse）
+
+### 回归（--longshot3-selftest，合成 sticky 页面 + 非周期纹理）
+    sticky+scroll3x90: canvas=800x1070 joined=3 gaps=0 pass=1
+    rollback-midway:   canvas=800x980  joined=2 gaps=0 pass=1
+    fastscroll-screen: appendMatched=0 sim: canvas=800x1600 joined=0 gaps=1 pass=1
+    ALL_PASS=true；--longshot2-selftest（渐变页）回归通过
+
+## 34. 1.9.2：修复部分电脑截图黑屏（DXGI 兼容）
+
+### 根因（按概率排序）
+1. HDR / 高级色彩显示器：Desktop Duplication 返回 R16G16B16A16_FLOAT（8 字节/像素
+   half float），旧代码不查 desc.Format 直接按 4 字节 ARGB memcpy -> 只拷一半数据、
+   行宽错乱 -> 全黑；且黑图被视为"覆盖完整"不触发 GDI 兜底
+2. 10bit 面板：R10G10B10A2_UNORM 被按 ARGB32 解读 -> 暗黑/异常
+3. 部分驱动/双显卡：新 duplication 首帧为黑帧，无检测
+4. 双显卡（Optimus）：D3D 设备建在默认适配器，输出在另一张卡时 DuplicateOutput
+   返回 UNSUPPORTED；另 CAPTUREBLT 在部分驱动/远程会话下 BitBlt 直接失败无重试
+
+### 修复（capture.cpp）
+- convertDuplicationRow：按 desc.Format 分派——B8G8R8A8 直拷 / R16G16B16A16_FLOAT
+  逐像素 half->float + 线性 scRGB->sRGB tone map / R10G10B10A2 10bit->8bit 解包；
+  其余格式返回 false 走 GDI 兜底
+- 黑帧防护：duplication 结果近全黑（>99.5% 像素 qGray<8）时用 GDI 交叉验证，
+  GDI 有内容则替换（真黑桌面 GDI 同黑，不误伤）
+- 双显卡：DuplicateOutput 失败时用输出所在适配器重建设备重试
+- captureRect：CAPTUREBLT 失败去掉该标志重试 BitBlt
+
+### 自检 --capture-selftest
+    hdr-f16:   ok=1 black=(0,0,0) white=(255,188,137) pass=1   （half 解码+tone map 数值正确）
+    r10g10b10: ok=1 px=0,64,128,255 pass=1                     （10bit->8bit 精确）
+    blackDetect: black=1 normal=0 pass=1
+    ALL_PASS=true；本机 --snap 2560x1440 dark%=0.0%；
+    全量回归（proxy/cloud/baidu-text/translate/longshot2/3/ui）全部通过

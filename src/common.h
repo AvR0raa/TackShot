@@ -4,7 +4,7 @@
 #define TS_APP_NAME_CN "图钉截图"
 
 #ifndef APP_VERSION
-#define APP_VERSION "1.9.0"
+#define APP_VERSION "1.9.2"
 #endif
 
 #define TS_ORG "TackShot"
